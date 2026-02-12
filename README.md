@@ -7,9 +7,9 @@ I came across an [obituary in The Economist for Douglas Lenat]([url](https://www
 The main idea is pretty simple: 
  - You send a message
  - An LLM:
-  - Interprets the message, crafts CycL (the unambigous, somewhat tedious, langauge used by Cyc)
-  - Confirms the Cyc Knowledge Base (KB) has the necessary bits of information needed to complete the required reasoning. If the KB is missing anything, the LLM supplies its best guess as a microtheorom (which is session-scoped and wont "pollute" the KB).
-  - Sends the CycL message to Cyc
-  - If Cyc throws an error the LLM will try to account for the issue and redo these steps. Current limited to 4 retries. 
+    - Interprets the message, crafts CycL (the unambigous, somewhat tedious, langauge used by Cyc)
+    - Confirms the Cyc Knowledge Base (KB) has the necessary bits of information needed to complete the required reasoning. If the KB is missing anything, the LLM supplies its best guess as a microtheorom (which is session-scoped and wont "pollute" the KB).
+    - Sends the CycL message to Cyc
+    - If Cyc throws an error the LLM will try to account for the issue and redo these steps. Current limited to 4 retries. 
  - Cyc will perform all the reasoning and produce a response.
  - The LLM will process that response before returning it to the user. Technically Cyc can prodcue some sort of natural language responses, but they seem a little redamentary, and I thought it would be helpful to have this second LLM interaction point to potentially allow for more flexibility in the format of the response (ie, if the user wanted it in LaTex)
