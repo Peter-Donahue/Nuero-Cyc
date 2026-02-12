@@ -1,0 +1,2 @@
+{"event": "trace_start", "session_id": "cfe932b3748c", "session_mt": "#$CycLLMSessionMt_cfe932b3748c", "genl_mt": "#$InferencePSC", "ollama_base_url": "http://localhost:11434", "ollama_model": "llama3.2", "ts": 1770856377.3843522}
+{"event": "trace_start", "session_id": "cfe932b3748c", "session_mt": "#$CycLLMSessionMt_cfe932b3748c", "genl_mt": "#$InferencePSC", "ollama_base_url": "http://localhost:11434", "ollama_model": "llama3.2", "ts": 1770856377.3853574}
