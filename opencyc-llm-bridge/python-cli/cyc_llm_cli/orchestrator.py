@@ -16,8 +16,10 @@ from .planner import (
     PlannerContext,
     answer_json_schema,
     build_answer_messages,
+    build_query_messages,
     build_planner_messages,
     plan_json_schema,
+    query_json_schema,
 )
 
 
@@ -312,8 +314,49 @@ class Orchestrator:
     def handle_user_prompt(self, user_prompt: str) -> RunResult:
         self.conversation.append({"role": "user", "content": user_prompt})
 
-        self._progress("interpreting prompt...")
-        plan, results, exec_log, answer_signal = self._plan_and_execute_with_repairs(user_prompt)
+        # Phase 1: translate to a CycL query and try it immediately.
+        self._progress("translating prompt to CycL...")
+        (
+            initial_query_spec,
+            initial_plan,
+            initial_results,
+            initial_exec_log,
+            initial_answer_signal,
+        ) = self._translate_and_execute_initial_query(user_prompt)
+
+        # Phase 2 (optional): if OpenCyc returns no bindings, ask the planner to add the
+        # minimal missing facts into the session MT and re-query.
+        used_plan = "initial_query"
+        plan = initial_plan
+        results = initial_results
+        exec_log = initial_exec_log
+        answer_signal = initial_answer_signal
+        supplement_plan: Optional[Dict[str, Any]] = None
+        supplement_results: Optional[Dict[str, Any]] = None
+        supplement_exec_log: Optional[List[Dict[str, Any]]] = None
+
+        if answer_signal is None:
+            self._progress("no answer found; attempting minimal supplementation...")
+            initial_error_context = {
+                "attempt": 0,
+                "error_type": "NoAnswerError",
+                "error": "OpenCyc returned no bindings for the initial translated query.",
+                "plan": initial_plan,
+                "execution_log": initial_exec_log,
+                "cyc_results": initial_results,
+                "initial_query_spec": initial_query_spec,
+            }
+            supplement_plan, supplement_results, supplement_exec_log, answer_signal = self._plan_and_execute_with_repairs(
+                user_prompt, initial_error_context=initial_error_context
+            )
+            used_plan = "supplement_plan"
+            plan = supplement_plan
+            results = supplement_results
+            exec_log = supplement_exec_log
+
+        if answer_signal is None:
+            # Defensive: should not happen because _plan_and_execute_with_repairs raises on failure.
+            raise NoAnswerError("No authoritative answer signal was produced by OpenCyc.")
 
         self._progress("formatting answer...")
         answer_json = self._generate_answer(user_prompt, results, exec_log, answer_signal)
@@ -326,6 +369,29 @@ class Orchestrator:
                 "session_id": self.session_info.session_id,
                 "session_mt": self.session_info.session_mt,
                 "genl_mt": self.session_info.genl_mt,
+            },
+            "used_plan": used_plan,
+            "initial_query": {
+                "query_spec": initial_query_spec,
+                "plan": initial_plan,
+                "execution_log": initial_exec_log,
+                "cyc_results": initial_results,
+                "answer_signal": None
+                if initial_answer_signal is None
+                else {
+                    "action_index": initial_answer_signal.action_index,
+                    "action_type": initial_answer_signal.action_type,
+                    "answer_text": initial_answer_signal.answer_text,
+                    "query": initial_answer_signal.query,
+                    "raw_value": initial_answer_signal.raw_value,
+                },
+            },
+            "supplement": None
+            if supplement_plan is None
+            else {
+                "plan": supplement_plan,
+                "execution_log": supplement_exec_log,
+                "cyc_results": supplement_results,
             },
             "plan": plan,
             "execution_log": exec_log,
@@ -443,10 +509,353 @@ class Orchestrator:
     # Planning + execution
     # -----------------------------
 
-    def _plan_and_execute_with_repairs(
+    # -----------------------------
+    # Query-first execution (no pre-asserts)
+    # -----------------------------
+
+    def _translate_and_execute_initial_query(
         self, user_prompt: str
+    ) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any], List[Dict[str, Any]], Optional[AnswerSignal]]:
+        """Translate the prompt into a single CycL query and run it.
+
+        If OpenCyc complains about undefined terms, we define those terms in the session MT and retry.
+        This avoids pre-emptive assertion and relies on OpenCyc to tell us what is missing.
+        """
+
+        # We build a dynamic plan that records every attempted action (failed queries, repairs, retries)
+        plan: Dict[str, Any] = {
+            "session_mt": self.ctx.session_mt,
+            "actions": [],
+            "final_response_instructions": "",
+        }
+        results: Dict[str, Any] = {
+            "session_mt": self.ctx.session_mt,
+            "actions": [],
+        }
+        exec_log: List[Dict[str, Any]] = []
+
+        query_spec: Optional[Dict[str, Any]] = None
+        translate_attempt = 0
+        define_attempt = 0
+        max_translate_attempts = self.settings.max_plan_retries + 1
+        max_define_attempts = 20
+
+        feedback: Optional[str] = None
+
+        # Initial translation
+        while query_spec is None:
+            if translate_attempt >= max_translate_attempts:
+                raise PlanValidationError("Failed to translate prompt into a valid CycL query.")
+            query_spec = self._translate_query_spec(user_prompt, feedback=feedback)
+            try:
+                query_spec = self._validate_and_normalize_query_spec(query_spec)
+            except PlanValidationError as e:
+                translate_attempt += 1
+                feedback = str(e)
+                query_spec = None
+
+        # Execute with iterative repairs
+        while True:
+            action = self._query_spec_to_action(query_spec)
+            idx = len(plan["actions"])
+            plan["actions"].append(action)
+
+            try:
+                self._progress("querying OpenCyc KB...")
+                self._execute_single_action(idx, action, results=results, exec_log=exec_log)
+            except CycBridgeError as e:
+                msg = e.server_message
+
+                # Identify missing constants (if any) from the Cyc error message.
+                consts = sorted(_extract_constants(msg))
+
+                safe_missing: List[str] = []
+                unsafe_missing: List[str] = []
+                for tok in consts:
+                    bare = tok[2:] if tok.startswith("#$") else tok
+                    if not bare:
+                        continue
+                    try:
+                        exists = self.cyc.constant_exists(bare)
+                    except CycBridgeError:
+                        # If we can't check existence, treat as unsafe and let re-translation handle it.
+                        unsafe_missing.append(tok)
+                        continue
+                    if exists:
+                        continue
+                    if self._safe_to_autocreate_constant(tok):
+                        safe_missing.append(tok)
+                    else:
+                        unsafe_missing.append(tok)
+
+                if safe_missing:
+                    define_attempt += 1
+                    if define_attempt > max_define_attempts:
+                        raise PlanExecutionError(
+                            f"Exceeded maximum missing-term repair attempts ({max_define_attempts}). Last error: {msg}"
+                        )
+
+                    self._progress("defining missing terms in session MT...")
+                    def_actions = self._build_definition_actions(missing_constants=safe_missing, query=query_spec["query"])
+                    for a in def_actions:
+                        a["mt"] = self.ctx.session_mt
+                        a_idx = len(plan["actions"])
+                        plan["actions"].append(a)
+                        self._execute_single_action(a_idx, a, results=results, exec_log=exec_log)
+
+                    # Retry the same query after definitions.
+                    continue
+
+                # If we have only "unsafe" missing terms (often a wrong built-in predicate like #$eq),
+                # treat this as a translation error and ask the LLM to re-translate.
+                translate_attempt += 1
+                if translate_attempt >= max_translate_attempts:
+                    raise PlanExecutionError(
+                        f"OpenCyc rejected the translated query and we exhausted translation retries. Last error: {msg}"
+                    )
+
+                feedback_obj = {
+                    "cyc_error": msg,
+                    "previous_query": query_spec.get("query"),
+                    "notes": "If you used a predicate that OpenCyc doesn't recognize (e.g., #$eq), replace it with a real Cyc predicate; do not invent new lowercase predicates.",
+                }
+                feedback = json.dumps(feedback_obj, indent=2)
+                self._progress("refining CycL translation after OpenCyc error...")
+                query_spec = self._translate_query_spec(user_prompt, feedback=feedback)
+                query_spec = self._validate_and_normalize_query_spec(query_spec)
+                continue
+
+            # Query succeeded (even if no bindings)
+            answer_signal = self._extract_answer_signal(plan, results)
+            return query_spec, plan, results, exec_log, answer_signal
+
+    def _translate_query_spec(self, user_prompt: str, *, feedback: Optional[str] = None) -> Dict[str, Any]:
+        prompt = user_prompt
+        if feedback:
+            prompt = f"{user_prompt}\n\nTRANSLATION FEEDBACK (fix and try again):\n{feedback}"
+
+        messages = build_query_messages(
+            ctx=self.ctx,
+            user_prompt=prompt,
+            conversation=self.conversation,
+        )
+        spec = self._llm_chat_json(kind="translator", messages=messages, schema=query_json_schema())
+        if not isinstance(spec, dict):
+            raise PlanValidationError(f"Translator returned non-object JSON: {type(spec)}")
+        return spec
+
+    def _validate_and_normalize_query_spec(self, spec: Dict[str, Any]) -> Dict[str, Any]:
+        qt = (spec.get("query_type") or "").strip()
+        if qt not in ("ask_var", "ask_true"):
+            raise PlanValidationError("Query spec must set query_type to ask_var or ask_true")
+
+        query = str(spec.get("query") or "").strip()
+        if not query:
+            raise PlanValidationError("Query spec must include non-empty 'query'")
+        if not _is_single_toplevel_cycl_form(query):
+            raise PlanValidationError(
+                "Query must be a single fully parenthesized CycL form starting with '(#$' and ending with ')'."
+            )
+        if query.startswith("(#$ist"):
+            raise PlanValidationError("Do not use #$ist in queries; mt is provided separately.")
+
+        var = str(spec.get("var") or "").strip()
+        limit_raw = spec.get("limit")
+        try:
+            limit = int(limit_raw) if limit_raw is not None else self.settings.default_bindings_limit
+        except Exception:
+            limit = self.settings.default_bindings_limit
+
+        if qt == "ask_var":
+            if not var:
+                var = "?X"
+            if not var.startswith("?"):
+                raise PlanValidationError("ask_var requires 'var' to start with '?' (e.g., ?X)")
+            if var not in query:
+                raise PlanValidationError("ask_var variable must appear in the query string")
+            if limit <= 0:
+                limit = self.settings.default_bindings_limit
+        else:
+            # ask_true
+            var = ""
+            limit = 0
+
+        return {
+            "query_type": qt,
+            "query": query,
+            "var": var,
+            "limit": limit,
+            "analysis_summary": str(spec.get("analysis_summary") or "").strip(),
+        }
+
+    def _query_spec_to_action(self, spec: Dict[str, Any]) -> Dict[str, Any]:
+        qt = spec["query_type"]
+        if qt == "ask_true":
+            return {
+                "type": "ask_true",
+                "query": spec["query"],
+                "mt": self.ctx.session_mt,
+            }
+        return {
+            "type": "ask_var",
+            "query": spec["query"],
+            "var": spec.get("var") or "?X",
+            "limit": int(spec.get("limit") or self.settings.default_bindings_limit),
+            "mt": self.ctx.session_mt,
+        }
+
+    def _safe_to_autocreate_constant(self, const_tok: str) -> bool:
+        """Heuristic: only auto-create CamelCase (or digit-starting) constants.
+
+        If a missing constant starts with a lowercase letter (e.g., #$eq), that's often a mistaken built-in
+        predicate/function name and should be fixed by re-translation, not by minting a new constant.
+        """
+        if not const_tok.startswith("#$") or len(const_tok) < 3:
+            return False
+        c0 = const_tok[2]
+        return c0.isupper() or c0.isdigit()
+
+    def _build_definition_actions(self, *, missing_constants: List[str], query: str) -> List[Dict[str, Any]]:
+        actions: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+
+        for tok in missing_constants:
+            if tok in seen:
+                continue
+            seen.add(tok)
+            bare = tok[2:] if tok.startswith("#$") else tok
+            if not bare:
+                continue
+
+            # 1) Ensure the constant exists.
+            actions.append({"type": "ensure_term", "name": bare})
+
+            # 2) Assert a minimal definition.
+            arities = self._find_head_arities(query, tok)
+            if arities:
+                arity = max(arities)
+                pred_type = {
+                    1: "#$UnaryPredicate",
+                    2: "#$BinaryPredicate",
+                    3: "#$TernaryPredicate",
+                    4: "#$QuaternaryPredicate",
+                }.get(arity, "#$Predicate")
+                actions.append({"type": "assert", "sentence": f"(#$isa {tok} {pred_type})"})
+            else:
+                actions.append({"type": "assert", "sentence": f"(#$isa {tok} #$Thing)"})
+
+        return actions
+
+    def _find_head_arities(self, expr: str, target_head: str) -> set[int]:
+        """Return the set of arities where target_head appears as the head of a list in expr."""
+        arities: set[int] = set()
+        self._find_head_arities_rec(expr, target_head, arities)
+        return arities
+
+    def _find_head_arities_rec(self, expr: str, target_head: str, out: set[int]) -> None:
+        tokens = _split_top_level_sexp(expr)
+        if not tokens:
+            return
+        head = tokens[0]
+        if head == target_head:
+            out.add(max(0, len(tokens) - 1))
+        for tok in tokens[1:]:
+            if tok.startswith("(") and tok.endswith(")"):
+                self._find_head_arities_rec(tok, target_head, out)
+
+    def _execute_single_action(
+        self,
+        idx: int,
+        action: Dict[str, Any],
+        *,
+        results: Dict[str, Any],
+        exec_log: List[Dict[str, Any]],
+    ) -> None:
+        """Execute a single action and log it, re-raising original exceptions.
+
+        This is used in the query-first loop so we can catch CycBridgeError directly and perform
+        missing-term repairs, while still recording a full action trace.
+        """
+
+        atype = (action.get("type") or "").strip()
+        mt = self.ctx.session_mt
+        entry: Dict[str, Any] = {"i": idx, "type": atype, "mt": mt}
+
+        if self.trace is not None:
+            self.trace.write("cyc_action_start", i=idx, type=atype, action=action)
+
+        try:
+            if atype == "ensure_term":
+                name = (action.get("name") or "").strip()
+                if not name:
+                    raise PlanExecutionError("ensure_term missing name")
+
+                exists = self.cyc.constant_exists(name)
+                entry["name"] = name
+                entry["exists"] = exists
+                if not exists:
+                    created = self.cyc.create_constant(name)
+                    entry["created"] = created
+
+            elif atype == "assert":
+                sentence = (action.get("sentence") or "").strip()
+                if not sentence:
+                    raise PlanExecutionError("assert missing sentence")
+                self.cyc.assert_sentence(mt=mt, sentence=sentence)
+                entry["sentence"] = sentence
+                entry["ok"] = True
+
+            elif atype == "ask_true":
+                query = (action.get("query") or "").strip()
+                if not query:
+                    raise PlanExecutionError("ask_true missing query")
+                ans = self.cyc.ask_true(mt=mt, query=query)
+                entry["query"] = query
+                entry["answer"] = ans
+
+            elif atype == "ask_var":
+                query = (action.get("query") or "").strip()
+                var = (action.get("var") or "?X").strip() or "?X"
+                limit = action.get("limit")
+                if limit is None:
+                    limit = self.settings.default_bindings_limit
+                else:
+                    try:
+                        limit = int(limit)
+                    except Exception:
+                        limit = self.settings.default_bindings_limit
+                if not query:
+                    raise PlanExecutionError("ask_var missing query")
+                bindings = self.cyc.ask_var(mt=mt, query=query, var=var, limit=limit)
+                entry["query"] = query
+                entry["var"] = var
+                entry["limit"] = limit
+                entry["bindings"] = bindings
+
+            else:
+                raise PlanExecutionError(f"Unknown action type: {atype}")
+
+            # success
+            results["actions"].append(entry)
+            exec_log.append(entry)
+
+        except Exception as e:
+            entry["error"] = str(e)
+            results["actions"].append(entry)
+            exec_log.append(entry)
+            raise
+
+        finally:
+            if self.trace is not None:
+                self.trace.write("cyc_action_end", i=idx, type=atype, entry=entry)
+
+    def _plan_and_execute_with_repairs(
+        self,
+        user_prompt: str,
+        *,
+        initial_error_context: Optional[Dict[str, Any]] = None,
     ) -> Tuple[Dict[str, Any], Dict[str, Any], List[Dict[str, Any]], AnswerSignal]:
-        error_context: Optional[Dict[str, Any]] = None
+        error_context: Optional[Dict[str, Any]] = initial_error_context
         last_exception: Optional[Exception] = None
 
         for attempt in range(self.settings.max_plan_retries + 1):
