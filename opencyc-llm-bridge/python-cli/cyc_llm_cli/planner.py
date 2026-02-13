@@ -117,7 +117,7 @@ Rules:
 
 CycL formatting rules (must follow):
 - All CycL sentences/queries MUST be fully parenthesized, e.g.: (#$isa #$Dog #$Animal)
-- Predicates must be Cyc constants like #$genls and #$isa (lowercase, with #$).
+- Predicates must be Cyc constants starting with #$ (e.g., #$genls, #$isa). Built-in predicates are often lowercase, but newly created predicates can be CamelCase.
 - Constants must start with #$ (e.g., #$Dog, #$Animal). No :DOG, no "DOG", no (QUOTE ...).
 - Numbers can be literal integers (e.g., 79).
 - Do NOT wrap queries/sentences with #$ist. The tool already takes mt separately.
@@ -127,12 +127,19 @@ CycL formatting rules (must follow):
   - Use ask_true ONLY for yes/no questions. For "how many / what / which" questions, end with ask_var.
 
 If you need to represent a missing scalar value and you cannot find an existing Cyc predicate:
-- Create a predicate constant (ensure_term) like EpisodeCountOfSeries (CamelCase),
-  assert its type as a binary predicate, then assert the value and re-query:
+- Create/ensure BOTH:
+  - a predicate constant (CamelCase) for the relationship, e.g., EpisodeCountOfSeries
+  - the concrete entity constant(s) from the user's question (e.g., StarTrekOriginalSeries)
+- IMPORTANT: Do NOT use generic placeholders like #$SomeSeries, #$SomeThing, #$SomeEntity.
+- Use separate assert actions for typing/value facts (do NOT put typing facts in ensure_term).
+- Then assert the predicate type, assert the value, and re-query so OpenCyc returns the value from the session MT.
+
+Example pattern (replace StarTrekOriginalSeries with the actual entity you are asked about):
   1) ensure_term: name=EpisodeCountOfSeries
-  2) assert: sentence=(#$isa #$EpisodeCountOfSeries #$BinaryPredicate)
-  3) assert: sentence=(#$EpisodeCountOfSeries #$SomeSeries 79)
-  4) ask_var: query=(#$EpisodeCountOfSeries #$SomeSeries ?N) var=?N
+  2) ensure_term: name=StarTrekOriginalSeries
+  3) assert: sentence=(#$isa #$EpisodeCountOfSeries #$BinaryPredicate)
+  4) assert: sentence=(#$EpisodeCountOfSeries #$StarTrekOriginalSeries 79)
+  5) ask_var: query=(#$EpisodeCountOfSeries #$StarTrekOriginalSeries ?N) var=?N
 {schema_str}
 """
 

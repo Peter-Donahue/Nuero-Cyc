@@ -132,6 +132,81 @@ def _normalize_constant_ref(name: str) -> str:
     return name if name.startswith("#$") else "#$" + name
 
 
+
+
+_CYC_CONST_RE = re.compile(r"#\$[A-Za-z0-9][A-Za-z0-9_\-]*")
+_INT_LIT_RE = re.compile(r"^-?\d+$")
+
+
+def _extract_constants(text: str) -> List[str]:
+    """Extract Cyc constant tokens like '#$FooBar' from a CycL string."""
+    return _CYC_CONST_RE.findall(text or "")
+
+
+def _is_int_literal(tok: str) -> bool:
+    return bool(_INT_LIT_RE.match((tok or "").strip()))
+
+
+def _split_top_level_sexp(expr: str) -> List[str]:
+    """Split a single top-level CycL S-expression into its top-level elements.
+
+    Example: '(#$P #$A 79)' -> ['#$P', '#$A', '79']
+    Nested subexpressions are kept as single tokens.
+    """
+    expr = (expr or "").strip()
+    if not expr.startswith("(") or not expr.endswith(")"):
+        return []
+    # We intentionally do not require _is_single_toplevel_cycl_form here because we also
+    # want to parse forms like (#$and (...) (...)) in a limited way.
+    inner = expr[1:-1]
+
+    tokens: List[str] = []
+    buf: List[str] = []
+    depth = 0
+    in_str = False
+    esc = False
+
+    def flush() -> None:
+        s = "".join(buf).strip()
+        if s:
+            tokens.append(s)
+        buf.clear()
+
+    for ch in inner:
+        if in_str:
+            buf.append(ch)
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+
+        if ch == '"':
+            in_str = True
+            buf.append(ch)
+            continue
+
+        if ch == "(":
+            depth += 1
+            buf.append(ch)
+            continue
+        if ch == ")":
+            depth = max(0, depth - 1)
+            buf.append(ch)
+            continue
+
+        if ch.isspace() and depth == 0:
+            flush()
+            continue
+
+        buf.append(ch)
+
+    flush()
+    return tokens
+
+
 class Orchestrator:
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -469,6 +544,16 @@ class Orchestrator:
         if final_type not in ("ask_var", "ask_true"):
             raise PlanValidationError("Plan must end with an ask_var or ask_true action.")
 
+        # Deterministic rewrites to address common planner mistakes:
+        # - model puts typing facts in ensure_term.sentence (we promote those into assert actions)
+        # - missing ensure_term for referenced constants (we auto-insert ensures before use)
+        # - swapped subject/predicate in scalar assertions (heuristic based on final ask_var)
+        rewritten_actions, rewrite_info = self._rewrite_actions_for_execution(normalized_actions)
+        normalized_actions = rewritten_actions
+
+        if self.trace is not None:
+            self.trace.write("plan_rewrite", **rewrite_info)
+
         # Ensure ensure_term constants are not placeholders and are actually used
         self._validate_ensure_terms_used(normalized_actions)
 
@@ -577,6 +662,211 @@ class Orchestrator:
                 raise PlanValidationError(
                     f"ensure_term constant {norm} is never used later in the plan. Avoid unused placeholders."
                 )
+
+
+    def _rewrite_actions_for_execution(
+        self, actions: List[Dict[str, Any]]
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        """Apply deterministic rewrites to make LLM plans executable/reliable.
+
+        These rewrites are intentionally conservative and only target common failure modes
+        observed in traces:
+        - putting CycL typing facts in ensure_term.sentence (ignored by executor) instead of assert
+        - referencing constants in sentences/queries without ensuring they exist
+        - accidentally swapping the subject/predicate when asserting a scalar value
+        """
+
+        info: Dict[str, Any] = {
+            "promoted_ensure_term_sentences": 0,
+            "auto_ensures_inserted": 0,
+            "dropped_duplicate_ensures": 0,
+            "dropped_unused_ensures": 0,
+            "heuristic_rewrites": 0,
+        }
+
+        # 1) Promote ensure_term.sentence -> assert immediately after the ensure_term.
+        expanded: List[Dict[str, Any]] = []
+        for a in actions:
+            t = (a.get("type") or "").strip()
+            if t == "ensure_term":
+                sent = (a.get("sentence") or "").strip()
+                a2 = dict(a)
+                # ensure_term executor ignores 'sentence' anyway; remove to avoid confusion.
+                if "sentence" in a2:
+                    a2.pop("sentence", None)
+                expanded.append(a2)
+
+                # If the model supplied a CycL sentence, treat it as an assert.
+                if sent and _is_single_toplevel_cycl_form(sent):
+                    expanded.append(
+                        {
+                            "type": "assert",
+                            "sentence": sent,
+                            "mt": self.ctx.session_mt,
+                        }
+                    )
+                    info["promoted_ensure_term_sentences"] += 1
+                continue
+
+            expanded.append(a)
+
+        actions = expanded
+
+        # 2) Fix a common inversion: assert (Subject 79) when final query is (Predicate Subject ?N)
+        actions, fixed = self._heuristic_fix_inverted_scalar_assert(actions)
+        info["heuristic_rewrites"] += fixed
+
+        # 3) Auto-insert ensure_term actions for any referenced constants that are not ensured yet.
+        actions, inserted, dropped_dups = self._auto_ensure_constants(actions)
+        info["auto_ensures_inserted"] = inserted
+        info["dropped_duplicate_ensures"] = dropped_dups
+
+        # 4) Drop ensure_term actions that appear after all uses (helps keep plans small and avoids validation noise)
+        actions, dropped_unused = self._drop_unused_ensure_terms(actions)
+        info["dropped_unused_ensures"] = dropped_unused
+
+        # 5) Final pass: normalize mt and validate inserted actions
+        normalized: List[Dict[str, Any]] = []
+        for a in actions:
+            t = (a.get("type") or "").strip()
+            if t and t != "converse":
+                a["mt"] = self.ctx.session_mt
+            normalized.append(self._validate_and_normalize_action(a))
+
+        return normalized, info
+
+    def _heuristic_fix_inverted_scalar_assert(
+        self, actions: List[Dict[str, Any]]
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        """Heuristic rewrite:
+        If the final action is ask_var with query like (P S ?N), and there is an assert like (S 79),
+        rewrite that assert into (P S 79).
+        """
+        if not actions:
+            return actions, 0
+        final = actions[-1]
+        if (final.get("type") or "").strip() != "ask_var":
+            return actions, 0
+
+        query = (final.get("query") or "").strip()
+        var = ((final.get("var") or "?X").strip() or "?X")
+        qtoks = _split_top_level_sexp(query)
+        if len(qtoks) < 3:
+            return actions, 0
+
+        pred = qtoks[0]
+        if not pred.startswith("#$"):
+            return actions, 0
+
+        subject: Optional[str] = None
+        for tok in qtoks[1:]:
+            if tok == var:
+                continue
+            if tok.startswith("#$"):
+                subject = tok
+                break
+        if subject is None:
+            return actions, 0
+
+        fixed = 0
+        out: List[Dict[str, Any]] = []
+        for a in actions:
+            if (a.get("type") or "").strip() == "assert":
+                sent = (a.get("sentence") or "").strip()
+                toks = _split_top_level_sexp(sent)
+                if len(toks) == 2 and toks[0] == subject and _is_int_literal(toks[1]):
+                    a2 = dict(a)
+                    a2["sentence"] = f"({pred} {subject} {toks[1]})"
+                    out.append(a2)
+                    fixed += 1
+                    continue
+            out.append(a)
+
+        return out, fixed
+
+    def _auto_ensure_constants(
+        self, actions: List[Dict[str, Any]]
+    ) -> Tuple[List[Dict[str, Any]], int, int]:
+        """Insert ensure_term actions before first use of each referenced constant."""
+        ensured: set[str] = set()
+        out: List[Dict[str, Any]] = []
+        inserted = 0
+        dropped_dups = 0
+
+        def ensure_const(const_tok: str) -> None:
+            nonlocal inserted
+            if not const_tok or not const_tok.startswith("#$"):
+                return
+            # session mts are created up-front; no need to ensure again
+            if const_tok.startswith("#$CycLLMSessionMt_"):
+                ensured.add(const_tok)
+                return
+            if const_tok in ensured:
+                return
+            out.append({"type": "ensure_term", "name": const_tok[2:], "mt": self.ctx.session_mt})
+            ensured.add(const_tok)
+            inserted += 1
+
+        for a in actions:
+            t = (a.get("type") or "").strip()
+
+            if t == "ensure_term":
+                name = (a.get("name") or "").strip()
+                if not name:
+                    out.append(a)
+                    continue
+                norm = _normalize_constant_ref(name)
+                if norm in ensured:
+                    dropped_dups += 1
+                    continue
+                # Normalize name to bare form (no '#$') for the tool call
+                a2 = dict(a)
+                a2["name"] = name[2:] if name.startswith("#$") else name
+                out.append(a2)
+                ensured.add(norm)
+                continue
+
+            refs: List[str] = []
+            if t == "assert":
+                refs = _extract_constants(str(a.get("sentence") or ""))
+            elif t in ("ask_true", "ask_var"):
+                refs = _extract_constants(str(a.get("query") or ""))
+
+            for c in sorted(set(refs)):
+                ensure_const(c)
+
+            out.append(a)
+
+        return out, inserted, dropped_dups
+
+    def _drop_unused_ensure_terms(self, actions: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int]:
+        """Remove ensure_term actions that are never referenced after their position."""
+        needed: set[str] = set()
+        kept_rev: List[Dict[str, Any]] = []
+        dropped = 0
+
+        for a in reversed(actions):
+            t = (a.get("type") or "").strip()
+
+            if t == "ensure_term":
+                name = (a.get("name") or "").strip()
+                norm = _normalize_constant_ref(name)
+                if norm in needed:
+                    kept_rev.append(a)
+                else:
+                    dropped += 1
+                continue
+
+            if t == "assert":
+                needed.update(_extract_constants(str(a.get("sentence") or "")))
+            elif t in ("ask_true", "ask_var"):
+                needed.update(_extract_constants(str(a.get("query") or "")))
+
+            kept_rev.append(a)
+
+        kept = list(reversed(kept_rev))
+        return kept, dropped
+
 
     def _execute_plan(self, plan: Dict[str, Any], exec_log: List[Dict[str, Any]]) -> Dict[str, Any]:
         results: Dict[str, Any] = {
