@@ -13,15 +13,26 @@ import org.opencyc.cycobject.CycConstant;
 import org.opencyc.cycobject.CycList;
 import org.opencyc.cycobject.CycObject;
 import org.opencyc.cycobject.CycVariable;
+import org.opencyc.cycobject.DefaultCycObject;
+import org.opencyc.parser.CycLParserUtil;
+import org.opencyc.parser.ParseException;
+import org.opencyc.parser.TokenMgrError;
+import org.opencyc.parser.UnsupportedVocabularyException;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
-import java.io.ByteArrayOutputStream;
 import java.lang.reflect.Method;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -35,24 +46,22 @@ import java.util.concurrent.TimeoutException;
  * This server is intentionally small and dependency-light:
  * - Java built-in HttpServer
  * - Jackson for JSON
- * - OpenCyc Java API jar provided by the user (see README)
+ * - OpenCyc Java API jar provided by the user
  *
- * Endpoints are designed for a "Cyc tool" interface that an LLM-driven orchestrator can call.
+ * Endpoints are designed for a "Cyc tool" interface that a Python CLI can call.
  */
 public class CycBridgeServer {
 
-    private static final ObjectMapper MAPPER = new ObjectMapper();
+    private static final ObjectMapper _MAPPER = new ObjectMapper();
     private static final int _HEALTH_CYC_TIMEOUT_MS = 5000;
 
-   // private static final int _HEALTH_CYC_TIMEOUT_MS = 5000;
-
     private static class JsonHandler implements HttpHandler {
-        private final CycBridge bridge;
-        private final String route;
+        private final CycBridge _BRIDGE;
+        private final String _ROUTE;
 
         JsonHandler(CycBridge bridge, String route) {
-            this.bridge = bridge;
-            this.route = route;
+            this._BRIDGE = bridge;
+            this._ROUTE = route;
         }
 
         @Override
@@ -66,33 +75,41 @@ public class CycBridgeServer {
                 Map<String, Object> body = readJson(exchange.getRequestBody());
                 Map<String, Object> resp;
 
-                switch (route) {
+                switch (_ROUTE) {
                     case "session":
-                        resp = bridge.ensureSessionMt(body);
+                        resp = _BRIDGE.ensureSessionMt(body);
                         sendJson(exchange, 200, resp);
                         break;
                     case "constant_exists":
-                        resp = bridge.constantExists(body);
+                        resp = _BRIDGE.constantExists(body);
                         sendJson(exchange, 200, resp);
                         break;
                     case "constant_create":
-                        resp = bridge.createConstant(body);
+                        resp = _BRIDGE.createConstant(body);
                         sendJson(exchange, 200, resp);
                         break;
                     case "assert":
-                        resp = bridge.assertSentence(body);
+                        resp = _BRIDGE.assertSentence(body);
                         sendJson(exchange, 200, resp);
                         break;
                     case "ask_true":
-                        resp = bridge.askTrue(body);
+                        resp = _BRIDGE.askTrue(body);
                         sendJson(exchange, 200, resp);
                         break;
                     case "ask_var":
-                        resp = bridge.askVar(body);
+                        resp = _BRIDGE.askVar(body);
                         sendJson(exchange, 200, resp);
                         break;
                     case "converse":
-                        resp = bridge.converse(body);
+                        resp = _BRIDGE.converse(body);
+                        sendJson(exchange, 200, resp);
+                        break;
+                    case "lex_lookup":
+                        resp = _BRIDGE.lexLookup(body);
+                        sendJson(exchange, 200, resp);
+                        break;
+                    case "cycl_parse":
+                        resp = _BRIDGE.cyclParse(body);
                         sendJson(exchange, 200, resp);
                         break;
                     default:
@@ -109,10 +126,10 @@ public class CycBridgeServer {
     }
 
     private static class HealthHandler implements HttpHandler {
-        private final CycBridge bridge;
+        private final CycBridge _BRIDGE;
 
         HealthHandler(CycBridge bridge) {
-            this.bridge = bridge;
+            this._BRIDGE = bridge;
         }
 
         @Override
@@ -124,17 +141,16 @@ public class CycBridgeServer {
 
             Map<String, Object> info = new LinkedHashMap<>();
             info.put("ok", true);
-            info.put("cyc_host", bridge.getCycHost());
-            info.put("cyc_port", bridge.getCycPort());
-            info.put("http_port", bridge.getHttpPort());
+            info.put("cyc_host", _BRIDGE.getCycHost());
+            info.put("cyc_port", _BRIDGE.getCycPort());
+            info.put("http_port", _BRIDGE.getHttpPort());
             info.put("timestamp_utc", new Date().toString());
 
-            // sanity check: try fetching a known constant
             try {
                 boolean canRead = callWithTimeout(new Callable<Boolean>() {
                     @Override
                     public Boolean call() throws Exception {
-                        return bridge.canRead();
+                        return _BRIDGE.canRead();
                     }
                 }, _HEALTH_CYC_TIMEOUT_MS);
                 info.put("cyc_connected", canRead);
@@ -166,6 +182,9 @@ public class CycBridgeServer {
         server.createContext("/api/v1/ask_var", new JsonHandler(bridge, "ask_var"));
         server.createContext("/api/v1/converse", new JsonHandler(bridge, "converse"));
 
+        server.createContext("/api/v1/lex/lookup", new JsonHandler(bridge, "lex_lookup"));
+        server.createContext("/api/v1/cycl/parse", new JsonHandler(bridge, "cycl_parse"));
+
         server.setExecutor(null); // default executor
         System.out.println("CycBridgeServer listening on http://localhost:" + httpPort);
         System.out.println("Connecting to OpenCyc at " + cycHost + ":" + cycPort);
@@ -176,7 +195,7 @@ public class CycBridgeServer {
     private static Map<String, Object> readJson(InputStream is) throws IOException {
         byte[] bytes = readAllBytesCompat(is);
         if (bytes.length == 0) return new HashMap<>();
-        return MAPPER.readValue(bytes, new TypeReference<Map<String, Object>>() {});
+        return _MAPPER.readValue(bytes, new TypeReference<Map<String, Object>>() {});
     }
 
     private static byte[] readAllBytesCompat(InputStream is) throws IOException {
@@ -215,7 +234,7 @@ public class CycBridgeServer {
     }
 
     private static void sendJson(HttpExchange exchange, int status, Map<String, Object> payload) throws IOException {
-        byte[] out = MAPPER.writeValueAsBytes(payload);
+        byte[] out = _MAPPER.writeValueAsBytes(payload);
         Headers headers = exchange.getResponseHeaders();
         headers.set("Content-Type", "application/json; charset=utf-8");
         headers.set("Access-Control-Allow-Origin", "*");
@@ -236,18 +255,16 @@ public class CycBridgeServer {
      * Keeps the OpenCyc connection alive and provides safe-ish endpoints.
      */
     static class CycBridge {
-        private final CycAccess cyc;
-        private final String cycHost;
-        private final int cycPort;
-        private final int httpPort;
+        private final CycAccess _CYC;
+        private final String _CYC_HOST;
+        private final int _CYC_PORT;
+        private final int _HTTP_PORT;
 
         CycBridge(String host, int port, int httpPort) throws Exception {
-            this.cycHost = host;
-            this.cycPort = port;
-            this.httpPort = httpPort;
+            this._CYC_HOST = host;
+            this._CYC_PORT = port;
+            this._HTTP_PORT = httpPort;
 
-            // The legacy OpenCyc API has different constructors across releases.
-            // Try common ones via reflection.
             CycAccess access = null;
             Exception last = null;
             try {
@@ -263,17 +280,16 @@ public class CycBridgeServer {
                 }
             }
             if (access == null) throw last != null ? last : new Exception("Failed to initialize CycAccess");
-            this.cyc = access;
+            this._CYC = access;
         }
 
-        public String getCycHost() { return cycHost; }
-        public int getCycPort() { return cycPort; }
-        public int getHttpPort() { return httpPort; }
+        public String getCycHost() { return _CYC_HOST; }
+        public int getCycPort() { return _CYC_PORT; }
+        public int getHttpPort() { return _HTTP_PORT; }
 
         public boolean canRead() throws Exception {
-            // Minimal connectivity check: these constants should exist in any OpenCyc KB.
-            CycObject baseKb = cyc.getConstantByName("#$BaseKB");
-            CycObject isa = cyc.getConstantByName("#$isa");
+            CycObject baseKb = _CYC.getConstantByName("#$BaseKB");
+            CycObject isa = _CYC.getConstantByName("#$isa");
             return baseKb != null && isa != null;
         }
 
@@ -284,9 +300,10 @@ public class CycBridgeServer {
             name = name.trim();
             if (name.isEmpty()) return name;
             if (name.startsWith("#$")) return name;
-            if (name.startsWith("?$")) return name; // not expected, but preserve
+            if (name.startsWith("?$")) return name;
             if (name.startsWith("?")) return name;  // variable
-            // allow user to pass "Dog" and treat as "#$Dog"
+            if (name.startsWith("(")) return name;  // NAUT / formula
+            if (name.startsWith("\"")) return name; // string literal
             return "#$" + name;
         }
 
@@ -298,56 +315,50 @@ public class CycBridgeServer {
         }
 
         private static String sanitizeForConstantBareName(String bare) {
-            // Cyc constant names are typically CamelCase with limited punctuation.
-            // Keep alnum and underscore; replace others with underscore.
             return bare.replaceAll("[^A-Za-z0-9_]", "_");
         }
 
         private CycObject getMt(String mt) throws Exception {
             String mtName = normalizeConstantName(mt);
             try {
-                return cyc.getConstantByName(mtName);
+                return _CYC.getConstantByName(mtName);
             } catch (CycApiException e) {
                 throw new Exception("Unknown microtheory: " + mtName, e);
             }
         }
 
-        // private CycList wrapIst(String mt, String sentenceOrQuery) throws Exception {
-        //     String mtName = normalizeConstantName(mt);
-        //     String s = "(#$ist " + mtName + " " + sentenceOrQuery + ")";
-        //     return cyc.makeCycList(s);
-        // }
-
-        // private void assertInMt(String mt, String sentence) throws Exception {
-        //     CycObject mtObj = getMt(mt);
-        //     CycList assertion = wrapIst(mt, sentence);
-        //     cyc.assertGaf(assertion, mtObj);
-        // }
         private void assertInMt(String mt, String sentence) throws Exception {
             CycObject mtObj = getMt(mt);
-            CycList assertion = cyc.makeCycList(sentence);
-            cyc.assertGaf(assertion, mtObj);
+            CycList assertion = _CYC.makeCycList(sentence);
+            _CYC.assertGaf(assertion, mtObj);
+        }
+
+        private static String escapeForCycString(String s) {
+            if (s == null) return "";
+            return s.replace("\\", "\\\\").replace("\"", "\\\"");
+        }
+
+        private static String safeCycToString(Object obj) {
+            if (obj == null) return null;
+            try {
+                return DefaultCycObject.cyclifyWithEscapeChars(obj, true);
+            } catch (Throwable t) {
+                return obj.toString();
+            }
         }
 
         // ---------- endpoints ----------
 
         public Map<String, Object> ensureSessionMt(Map<String, Object> body) throws Exception {
             String sessionId = (String) body.getOrDefault("session_id", UUID.randomUUID().toString().replace("-", ""));
-            String comment = (String) body.getOrDefault("comment", "Auto-created session microtheory for Cyc LLM bridge.");
+            String comment = (String) body.getOrDefault("comment", "Auto-created session microtheory for Cyc bridge.");
             String genl = (String) body.getOrDefault("genl_mt", "#$BaseKB");
 
-            // Build a deterministic, readable constant name
             String bare = "CycLLMSessionMt_" + sanitizeForConstantBareName(sessionId);
             CycConstant mtConst = ensureConstantInternal(bare);
 
-            String mtName = normalizeConstantName(mtConst.toString());
-            // In some API versions, mtConst.toString() yields "#$Name"; in others it may yield "Name".
-            // Ensure "#$".
-            mtName = normalizeConstantName(stripConstantPrefix(mtName));
+            String mtName = normalizeConstantName(stripConstantPrefix(mtConst.toString()));
 
-            // Ensure it's a microtheory and has a parent MT
-            // These assertions go into BaseKB by default.
-            // NOTE: You can change this to another administrative MT if desired.
             String adminMt = "#$BaseKB";
             assertInMt(adminMt, "(#$isa " + mtName + " #$Microtheory)");
             assertInMt(adminMt, "(#$genlMt " + mtName + " " + normalizeConstantName(genl) + ")");
@@ -368,7 +379,7 @@ public class CycBridgeServer {
 
             boolean exists;
             try {
-                exists = cyc.getConstantByName(name) != null;
+                exists = _CYC.getConstantByName(name) != null;
             } catch (CycApiException e) {
                 exists = false;
             }
@@ -386,34 +397,30 @@ public class CycBridgeServer {
         }
 
         private CycConstant ensureConstantInternal(String bareName) throws Exception {
-            // Try lookup first
             String full = normalizeConstantName(bareName);
             try {
-                CycConstant existing = cyc.getConstantByName(full);
+                CycConstant existing = _CYC.getConstantByName(full);
                 if (existing != null) return existing;
             } catch (CycApiException ignored) {}
 
-            // Try createNewPermanent(String)
             try {
-                Method m = cyc.getClass().getMethod("createNewPermanent", String.class);
-                Object o = m.invoke(cyc, bareName);
+                Method m = _CYC.getClass().getMethod("createNewPermanent", String.class);
+                Object o = m.invoke(_CYC, bareName);
                 if (o instanceof CycConstant) return (CycConstant) o;
             } catch (NoSuchMethodException ignored) {
                 // fall through
             }
 
-            // Try makeCycConstant(String) (some OpenCyc APIs)
             try {
-                Method m = cyc.getClass().getMethod("makeCycConstant", String.class);
-                Object o = m.invoke(cyc, bareName);
+                Method m = _CYC.getClass().getMethod("makeCycConstant", String.class);
+                Object o = m.invoke(_CYC, bareName);
                 if (o instanceof CycConstant) return (CycConstant) o;
             } catch (NoSuchMethodException ignored) {
                 // fall through
             }
 
-            // As a last resort, attempt to fetch again (some APIs create implicitly)
             try {
-                CycConstant existing = cyc.getConstantByName(full);
+                CycConstant existing = _CYC.getConstantByName(full);
                 if (existing != null) return existing;
             } catch (CycApiException ignored) {}
 
@@ -426,16 +433,12 @@ public class CycBridgeServer {
             String sentence = (String) body.get("sentence");
             if (sentence == null) throw new Exception("Missing 'sentence'");
 
-            // Defensive validation: the legacy OpenCyc API expects a CycList.
-            // If the incoming sentence isn't a single parenthesized CycL form,
-            // cyc.makeCycList(...) may throw a ClassCastException. Fail fast with a clear message.
             String sTrim = sentence.trim();
             if (!(sTrim.startsWith("(") && sTrim.endsWith(")"))) {
                 throw new Exception("CycL sentence must be fully parenthesized, e.g. '(#$isa #$Dog #$Animal)'. Got: " + sTrim);
             }
 
             assertInMt(mt, sentence);
-
             return mapOf("ok", true);
         }
 
@@ -449,12 +452,9 @@ public class CycBridgeServer {
                 throw new Exception("CycL query must be fully parenthesized, e.g. '(#$isa #$Dog #$Animal)'. Got: " + qTrim);
             }
 
-            //CycObject mtObj = getMt(mt);
-            //CycList q = wrapIst(mt, query);
-            //boolean ans = cyc.isQueryTrue(q, mtObj);
             CycObject mtObj = getMt(mt);
-            CycList q = cyc.makeCycList(query);
-            boolean ans = cyc.isQueryTrue(q, mtObj);
+            CycList q = _CYC.makeCycList(query);
+            boolean ans = _CYC.isQueryTrue(q, mtObj);
 
             return mapOf("ok", true, "answer", ans);
         }
@@ -469,19 +469,13 @@ public class CycBridgeServer {
 
             String qTrim = query.trim();
             if (!(qTrim.startsWith("(") && qTrim.endsWith(")"))) {
-                throw new Exception("CycL query must be fully parenthesized, e.g. '(#$isa #$Dog #$Animal)'. Got: " + qTrim);
+                throw new Exception("CycL query must be fully parenthesized, e.g. '(#$isa ?X #$Dog)'. Got: " + qTrim);
             }
 
-            // CycObject mtObj = getMt(mt);
-            // CycList q = wrapIst(mt, query);
-            // CycVariable v = CycObjectFactory.makeCycVariable(var);
-            // CycList ret = cyc.askWithVariable(q, v, mtObj);
             CycObject mtObj = getMt(mt);
-            CycList q = cyc.makeCycList(query);
+            CycList q = _CYC.makeCycList(query);
             CycVariable v = CycObjectFactory.makeCycVariable(var);
-            CycList ret = cyc.askWithVariable(q, v, mtObj);
-
-
+            CycList ret = _CYC.askWithVariable(q, v, mtObj);
 
             List<String> bindings = new ArrayList<>();
             int n = Math.min(limit, ret.size());
@@ -502,18 +496,13 @@ public class CycBridgeServer {
             if (subl == null) throw new Exception("Missing 'subl'");
 
             String result = converseInternal(subl);
-
-            Map<String, Object> resp = new LinkedHashMap<>();
-            resp.put("ok", true);
-            resp.put("result", result);
-            return resp;
+            return mapOf("ok", true, "result", result);
         }
 
         private String converseInternal(String subl) throws Exception {
-            // Prefer: cyc.converse().converseObject(subl)
             try {
-                Method converseMethod = cyc.getClass().getMethod("converse");
-                Object conn = converseMethod.invoke(cyc);
+                Method converseMethod = _CYC.getClass().getMethod("converse");
+                Object conn = converseMethod.invoke(_CYC);
                 Method convObjMethod = conn.getClass().getMethod("converseObject", String.class);
                 Object result = convObjMethod.invoke(conn, subl);
                 return result == null ? null : result.toString();
@@ -521,10 +510,9 @@ public class CycBridgeServer {
                 // try next
             }
 
-            // Fallback: cyc.converseObject(subl)
             try {
-                Method m = cyc.getClass().getMethod("converseObject", String.class);
-                Object result = m.invoke(cyc, subl);
+                Method m = _CYC.getClass().getMethod("converseObject", String.class);
+                Object result = m.invoke(_CYC, subl);
                 return result == null ? null : result.toString();
             } catch (NoSuchMethodException ignored) {
                 // give up
@@ -533,10 +521,122 @@ public class CycBridgeServer {
             throw new Exception("This OpenCyc Java API jar does not expose converse()/converseObject().");
         }
 
-        private static String escapeForCycString(String s) {
-            if (s == null) return "";
-            // Cyc strings are in double quotes; escape backslash and quotes.
-            return s.replace("\\", "\\\\").replace("\"", "\\\"");
+        // ----------------------------
+        // Lexicon lookup endpoint
+        // ----------------------------
+
+        public Map<String, Object> lexLookup(Map<String, Object> body) throws Exception {
+            String kind = (String) body.getOrDefault("kind", "noun");
+            String lemma = (String) body.get("lemma");
+            String text = (String) body.get("text");
+            String mt = (String) body.getOrDefault("mt", "#$EnglishLexicalMt");
+            int limit = ((Number) body.getOrDefault("limit", 50)).intValue();
+
+            String key = (lemma != null && !lemma.isEmpty()) ? lemma : text;
+            if (key == null || key.trim().isEmpty()) {
+                throw new Exception("lex_lookup requires 'lemma' or 'text'");
+            }
+
+            String escaped = escapeForCycString(key.trim());
+
+            String query;
+            String var;
+            if ("noun".equalsIgnoreCase(kind)) {
+                query = "(#$and (#$lex ?FORM ?W (\"" + escaped + "\")) (#$denotation ?W #$SimpleNoun 0 ?DENOT))";
+                var = "?DENOT";
+            } else if ("verb".equalsIgnoreCase(kind)) {
+                query = "(#$and (#$lex ?FORM ?W (\"" + escaped + "\")) (#$denotation ?W #$Verb 0 ?PRED))";
+                var = "?PRED";
+            } else if ("adj".equalsIgnoreCase(kind) || "adjective".equalsIgnoreCase(kind)) {
+                query = "(#$and (#$lex ?FORM ?W (\"" + escaped + "\")) (#$denotation ?W #$Adjective 0 ?PRED))";
+                var = "?PRED";
+            } else if ("proper".equalsIgnoreCase(kind) || "name".equalsIgnoreCase(kind)) {
+                // names are usually in BaseKB or a general mt; caller can override mt.
+                query = "(#$and (#$nameString ?C \"" + escaped + "\") (#$isa ?C #$Individual))";
+                var = "?C";
+            } else {
+                throw new Exception("Unknown lex_lookup kind: " + kind);
+            }
+
+            CycObject mtObj = getMt(mt);
+            CycList q = _CYC.makeCycList(query);
+            CycVariable v = CycObjectFactory.makeCycVariable(var);
+            CycList ret = _CYC.askWithVariable(q, v, mtObj);
+
+            List<String> candidates = new ArrayList<>();
+            int n = Math.min(limit, ret.size());
+            for (int i = 0; i < n; i++) {
+                Object o = ret.get(i);
+                candidates.add(o == null ? null : o.toString());
+            }
+
+            Map<String, Object> resp = new LinkedHashMap<>();
+            resp.put("ok", true);
+            resp.put("kind", kind);
+            resp.put("key", key);
+            resp.put("mt", normalizeConstantName(mt));
+            resp.put("query", query);
+            resp.put("var", var);
+            resp.put("candidates", candidates);
+            resp.put("count", candidates.size());
+            return resp;
+        }
+
+        // ----------------------------
+        // CycL parsing/canonicalization endpoint
+        // ----------------------------
+
+        public Map<String, Object> cyclParse(Map<String, Object> body) throws Exception {
+            String text = (String) body.get("text");
+            if (text == null) throw new Exception("Missing 'text'");
+
+            String kind = (String) body.getOrDefault("kind", "sentence");
+            boolean testEof = (body.get("test_eof") instanceof Boolean) ? (Boolean) body.get("test_eof") : true;
+            String mode = (String) body.getOrDefault("mode", "none");
+
+            Object parsed;
+            try {
+                if ("sentence".equalsIgnoreCase(kind)) {
+                    parsed = CycLParserUtil.parseCycLSentence(text, testEof, _CYC);
+                } else if ("term".equalsIgnoreCase(kind)) {
+                    parsed = CycLParserUtil.parseCycLTerm(text, testEof, _CYC);
+                } else if ("term_list".equalsIgnoreCase(kind)) {
+                    parsed = CycLParserUtil.parseCycLTermList(text, testEof, _CYC);
+                } else if ("string".equalsIgnoreCase(kind)) {
+                    parsed = CycLParserUtil.parseCycLString(text, testEof, _CYC);
+                } else if ("number".equalsIgnoreCase(kind)) {
+                    parsed = CycLParserUtil.parseCycLNumber(text, testEof, _CYC);
+                } else if ("constant".equalsIgnoreCase(kind)) {
+                    parsed = CycLParserUtil.parseCycLConstant(text, testEof, _CYC);
+                } else if ("variable".equalsIgnoreCase(kind)) {
+                    parsed = CycLParserUtil.parseCycLVariable(text, testEof, _CYC);
+                } else {
+                    throw new Exception("Unknown kind: " + kind);
+                }
+
+                if ("nart".equalsIgnoreCase(mode) || "nart_substitute".equalsIgnoreCase(mode)) {
+                    parsed = CycLParserUtil.nartSubstitute(parsed, _CYC);
+                } else if ("hl".equalsIgnoreCase(mode) || "to_hl".equalsIgnoreCase(mode)) {
+                    parsed = CycLParserUtil.toHL(parsed, _CYC);
+                }
+
+            } catch (ParseException | UnsupportedVocabularyException | TokenMgrError e) {
+                Map<String, Object> err = new LinkedHashMap<>();
+                err.put("ok", false);
+                err.put("error", e.getClass().getSimpleName());
+                err.put("message", e.getMessage());
+                err.put("kind", kind);
+                return err;
+            }
+
+            Map<String, Object> resp = new LinkedHashMap<>();
+            resp.put("ok", true);
+            resp.put("kind", kind);
+            resp.put("mode", mode);
+            resp.put("java_class", parsed == null ? null : parsed.getClass().getName());
+            resp.put("value", parsed == null ? null : parsed.toString());
+            resp.put("cyclified", safeCycToString(parsed));
+            return resp;
         }
     }
 }
