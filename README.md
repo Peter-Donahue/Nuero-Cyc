@@ -4,7 +4,8 @@ I came across an obituary for Douglas Lenat (creator of Cyc) and fell down the r
 
 - Economist obituary: https://www.economist.com/obituary/2023/09/13/douglas-lenat-trained-computers-to-think-the-old-fashioned-way
 - OpenCyc fork / last version: https://github.com/Peter-Donahue/opencyc
-
+- CoreNLP fork: https://github.com/Peter-Donahue/CoreNLP
+  
 This repo is still a prototype: limited natural-language coverage, rough edges, and plenty of “works for the cases I tried”.
 
 ## What this project does now
