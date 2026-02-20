@@ -1,33 +1,17 @@
 from __future__ import annotations
 
-import json
-import os
 import re
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 from .config import Settings
 from .cyc_bridge_client import CycBridgeClient, CycBridgeError, SessionInfo
-from .llm_trace import LLMTrace, NullTrace, TraceConfig
-from .ollama_client import OllamaClient, OllamaError
-from .planner import (
-    PlannerContext,
-    answer_json_schema,
-    build_answer_messages,
-    build_query_messages,
-    build_planner_messages,
-    plan_json_schema,
-    query_json_schema,
-)
+
+from . import corenlp_to_cycl as _E2C
 
 
-class PlanValidationError(RuntimeError):
-    pass
-
-
-class PlanExecutionError(RuntimeError):
+class TranslationError(RuntimeError):
     pass
 
 
@@ -36,15 +20,6 @@ class NoAnswerError(RuntimeError):
 
 
 @dataclass(frozen=True)
-class AnswerSignal:
-    action_index: int
-    action_type: str  # ask_var | ask_true
-    answer_text: str
-    raw_value: Any
-    query: Optional[str] = None
-
-
-@dataclass
 class RunResult:
     answer: str
     cyc_evidence: List[str]
@@ -52,96 +27,37 @@ class RunResult:
     debug: Dict[str, Any]
 
 
-_JSON_OBJ_RE = re.compile(r"\{.*\}", re.DOTALL)
-
-
-def _parse_jsonish(raw: str) -> Any:
-    raw = (raw or "").strip()
-    if not raw:
-        raise OllamaError("Empty response when JSON was expected.")
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        m = _JSON_OBJ_RE.search(raw)
-        if m:
-            try:
-                return json.loads(m.group(0))
-            except json.JSONDecodeError:
-                pass
-    raise OllamaError(f"Model did not return valid JSON. Raw: {raw[:500]}")
-
-
-def _is_single_toplevel_cycl_form(s: str) -> bool:
-    """Return True if `s` looks like a single, fully-parenthesized CycL expression.
-
-    This is a defensive check to prevent common LLM failure modes like:
-    - missing parentheses ("#$isa ...")
-    - multiple top-level forms ("(?x) (...)")
-    - variable-first forms
-    """
-
-    s = (s or "").strip()
-    if not s:
-        return False
-    if not (s.startswith("(") and s.endswith(")")):
-        return False
-
-    # The head symbol in CycL should virtually always be a Cyc constant (e.g., #$isa, #$and).
-    i = 1
-    while i < len(s) and s[i].isspace():
-        i += 1
-    if s[i : i + 2] != "#$":
-        return False
-
-    depth = 0
-    in_str = False
-    esc = False
-
-    for idx, ch in enumerate(s):
-        if in_str:
-            if esc:
-                esc = False
-                continue
-            if ch == "\\":
-                esc = True
-                continue
-            if ch == '"':
-                in_str = False
-            continue
-
-        if ch == '"':
-            in_str = True
-            continue
-
-        if ch == "(":
-            depth += 1
-        elif ch == ")":
-            depth -= 1
-            if depth < 0:
-                return False
-            # If we close the outermost form before the end, ensure the rest is whitespace.
-            if depth == 0 and idx != len(s) - 1:
-                if any(not c.isspace() for c in s[idx + 1 :]):
-                    return False
-
-    return depth == 0 and not in_str
-
-
-def _normalize_constant_ref(name: str) -> str:
-    name = (name or "").strip()
-    if not name:
-        return name
-    return name if name.startswith("#$") else "#$" + name
-
-
-
-
 _CYC_CONST_RE = re.compile(r"#\$[A-Za-z0-9][A-Za-z0-9_\-]*")
 _INT_LIT_RE = re.compile(r"^-?\d+$")
 
+# CycL quantifiers supported by your CycLParser grammar and used by corenlp_to_cycl.py.
+_QUANTIFIER_HEADS: Set[str] = {
+    "#$forAll",
+    "#$thereExists",
+    "#$thereExistExactly",
+    "#$thereExistAtMost",
+    "#$thereExistAtLeast",
+}
+
+# Variables produced by corenlp_to_cycl.py for WH-words.
+_WH_VAR_PRIORITY: Sequence[str] = ("?Who", "?What", "?Which", "?Where", "?When")
+
+
+_NL_STRING_PREDICATES: Sequence[str] = (
+    "#$preferredNameString",
+    "#$nameString",
+    "#$termStrings",
+    "#$termStrings-GuessedFromName",
+    "#$acronymString",
+    "#$initialismString",
+    "#$abbreviationString-PN",
+)
+
+
+CycLTerm = _E2C.CycLTerm
+
 
 def _extract_constants(text: str) -> List[str]:
-    """Extract Cyc constant tokens like '#$FooBar' from a CycL string."""
     return _CYC_CONST_RE.findall(text or "")
 
 
@@ -158,8 +74,6 @@ def _split_top_level_sexp(expr: str) -> List[str]:
     expr = (expr or "").strip()
     if not expr.startswith("(") or not expr.endswith(")"):
         return []
-    # We intentionally do not require _is_single_toplevel_cycl_form here because we also
-    # want to parse forms like (#$and (...) (...)) in a limited way.
     inner = expr[1:-1]
 
     tokens: List[str] = []
@@ -209,36 +123,170 @@ def _split_top_level_sexp(expr: str) -> List[str]:
     return tokens
 
 
+def _find_head_arities(expr: str, target_head: str) -> Set[int]:
+    arities: Set[int] = set()
+    _find_head_arities_rec(expr, target_head, arities)
+    return arities
+
+
+def _find_head_arities_rec(expr: str, target_head: str, out: Set[int]) -> None:
+    toks = _split_top_level_sexp(expr)
+    if not toks:
+        return
+    head = toks[0]
+    if head == target_head:
+        out.add(max(0, len(toks) - 1))
+    for tok in toks[1:]:
+        if tok.startswith("(") and tok.endswith(")"):
+            _find_head_arities_rec(tok, target_head, out)
+
+
+def _collect_vars(term: CycLTerm) -> Set[str]:
+    if isinstance(term, str):
+        return {term} if term.startswith("?") else set()
+    out: Set[str] = set()
+    for a in term:
+        out |= _collect_vars(a)
+    return out
+
+
+def _free_vars(term: CycLTerm, bound: Optional[Set[str]] = None) -> Set[str]:
+    bound2: Set[str] = set(bound or set())
+    if isinstance(term, str):
+        if term.startswith("?") and term not in bound2:
+            return {term}
+        return set()
+
+    if not term:
+        return set()
+
+    head = term[0]
+    if isinstance(head, str) and head in _QUANTIFIER_HEADS and len(term) >= 3:
+        var = term[1]
+        body = term[2]
+        if isinstance(var, str) and var.startswith("?"):
+            bound2 = set(bound2)
+            bound2.add(var)
+        return _free_vars(body, bound2)
+
+    out: Set[str] = set()
+    for a in term:
+        out |= _free_vars(a, bound2)
+    return out
+
+
+def _drop_quantifier(term: CycLTerm, var: str) -> CycLTerm:
+    """Remove any quantifier binding `var` (thereExists/forAll/etc), making `var` free."""
+    if isinstance(term, str):
+        return term
+    if not term:
+        return term
+
+    head = term[0]
+    if isinstance(head, str) and head in _QUANTIFIER_HEADS and len(term) >= 3:
+        q_var = term[1]
+        body = term[2]
+        if q_var == var:
+            return _drop_quantifier(body, var)
+        return [head, q_var, _drop_quantifier(body, var)]
+
+    return [_drop_quantifier(a, var) for a in term]
+
+
+def _close_free_vars(term: CycLTerm, *, keep_free: Set[str]) -> CycLTerm:
+    free = _free_vars(term)
+    to_bind = sorted(v for v in free if v not in keep_free)
+    out = term
+    for v in to_bind:
+        out = ["#$thereExists", v, out]
+    return out
+
+
+def _looks_like_question(text: str) -> bool:
+    t = (text or "").strip()
+    if not t:
+        return False
+    if t.endswith("?"):
+        return True
+    # Heuristic: leading auxiliaries often mark yes/no questions.
+    first = re.split(r"\s+", t, maxsplit=1)[0].lower()
+    return first in {
+        "is",
+        "are",
+        "was",
+        "were",
+        "do",
+        "does",
+        "did",
+        "can",
+        "could",
+        "will",
+        "would",
+        "should",
+        "has",
+        "have",
+        "had",
+        "may",
+        "might",
+        "must",
+    }
+
+
+def _unquote_cyc_string(s: str) -> str:
+    t = (s or "").strip()
+    if len(t) >= 2 and t[0] == '"' and t[-1] == '"':
+        inner = t[1:-1]
+        # Unescape minimal Cyc string escapes.
+        inner = inner.replace("\\\\", "\\").replace('\\"', '"')
+        return inner
+    return t
+
+
 class Orchestrator:
     def __init__(self, settings: Settings):
         self.settings = settings
         self.cyc = CycBridgeClient(settings.cyc_bridge_base_url)
-        self.ollama = OllamaClient(settings.ollama_base_url)
 
         self.session_info = self._init_session()
-        self.ctx = PlannerContext(
-            session_mt=self.session_info.session_mt,
-            session_genl_mt=self.session_info.genl_mt,
-            debug=False,
-        )
-        self.allow_converse = False
-
-        # conversation = [{"role":"user"/"assistant","content":"..."}]
-        self.conversation: List[Dict[str, str]] = []
+        self.debug: bool = False
 
         # Optional progress callback (UI layer)
         self._progress_cb: Optional[Callable[[str], None]] = None
 
-        # Optional LLM trace
-        self.trace: Optional[LLMTrace] = None
-        self.trace_path: Optional[str] = None
+        # CoreNLP client
+        self._nlp = _E2C.CoreNLPServerClient(
+            base_url=settings.corenlp_base_url,
+            timeout_sec=int(settings.http_timeout_sec),
+        )
+
+        # Cyc-backed lexicon/scoring (used by corenlp_to_cycl translator)
+        lex_bridge: Optional[_E2C.CycBridgeClient] = None
+        if settings.use_cyc_lexicon or settings.use_cyc_scorer:
+            lex_bridge = _E2C.CycBridgeClient(
+                base_url=settings.cyc_bridge_base_url,
+                timeout_sec=int(settings.http_timeout_sec),
+            )
+
+        lexicon = _E2C.CycLexicon(
+            bridge=lex_bridge if settings.use_cyc_lexicon else None,
+            lex_mt=settings.cyc_lexicon_mt,
+            lex_limit=int(settings.cyc_lex_limit),
+        )
+
+        self._translator = _E2C.CycLTranslator(
+            lexicon=lexicon,
+            query_mt=settings.cyc_query_mt,
+            enable_scorer=bool(settings.use_cyc_scorer),
+        )
+
+        self._nl_mt = settings.cyc_nl_mt.strip() or settings.cyc_lexicon_mt
 
     # -----------------------------
-    # Lifecycle
+    # Lifecycle / UI hooks
     # -----------------------------
 
     def close(self) -> None:
-        self.disable_trace()
+        return
 
     def set_progress_callback(self, cb: Optional[Callable[[str], None]]) -> None:
         self._progress_cb = cb
@@ -246,47 +294,9 @@ class Orchestrator:
     def _progress(self, msg: str) -> None:
         if self._progress_cb is not None:
             self._progress_cb(msg)
-        if self.trace is not None:
-            self.trace.write("progress", message=msg)
 
-    def enable_trace(self, path: Optional[str] = None) -> str:
-        """Enable JSONL tracing of LLM calls (and related orchestration events)."""
-
-        if path is None or path == "auto":
-            ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-            fname = f"llm_calls_{self.session_info.session_id}_{ts}.jsonl"
-            path = os.path.join(self.settings.llm_trace_dir, fname)
-
-        # Close existing trace if any
-        self.disable_trace()
-
-        t = LLMTrace(TraceConfig(path=path))
-        self.trace = t
-        self.trace_path = path
-
-        t.write(
-            "trace_start",
-            session_id=self.session_info.session_id,
-            session_mt=self.session_info.session_mt,
-            genl_mt=self.session_info.genl_mt,
-            cyc_bridge_base_url=self.settings.cyc_bridge_base_url,
-            ollama_base_url=self.settings.ollama_base_url,
-            ollama_model=self.settings.ollama_model,
-        )
-
-        return path
-
-    def disable_trace(self) -> None:
-        if self.trace is not None:
-            try:
-                self.trace.write("trace_end")
-            except Exception:
-                pass
-            try:
-                self.trace.close()
-            finally:
-                self.trace = None
-                self.trace_path = None
+    def set_debug(self, enabled: bool) -> None:
+        self.debug = bool(enabled)
 
     # -----------------------------
     # Session
@@ -300,1229 +310,299 @@ class Orchestrator:
             genl_mt=self.settings.session_mt_genl,
         )
 
-    def set_debug(self, enabled: bool) -> None:
-        self.ctx = PlannerContext(
-            session_mt=self.ctx.session_mt,
-            session_genl_mt=self.ctx.session_genl_mt,
-            debug=enabled,
-        )
-
     # -----------------------------
     # Public API
     # -----------------------------
 
     def handle_user_prompt(self, user_prompt: str) -> RunResult:
-        self.conversation.append({"role": "user", "content": user_prompt})
-
-        # Phase 1: translate to a CycL query and try it immediately.
-        self._progress("translating prompt to CycL...")
-        (
-            initial_query_spec,
-            initial_plan,
-            initial_results,
-            initial_exec_log,
-            initial_answer_signal,
-        ) = self._translate_and_execute_initial_query(user_prompt)
-
-        # Phase 2 (optional): if OpenCyc returns no bindings, ask the planner to add the
-        # minimal missing facts into the session MT and re-query.
-        used_plan = "initial_query"
-        plan = initial_plan
-        results = initial_results
-        exec_log = initial_exec_log
-        answer_signal = initial_answer_signal
-        supplement_plan: Optional[Dict[str, Any]] = None
-        supplement_results: Optional[Dict[str, Any]] = None
-        supplement_exec_log: Optional[List[Dict[str, Any]]] = None
-
-        if answer_signal is None:
-            self._progress("no answer found; attempting minimal supplementation...")
-            initial_error_context = {
-                "attempt": 0,
-                "error_type": "NoAnswerError",
-                "error": "OpenCyc returned no bindings for the initial translated query.",
-                "plan": initial_plan,
-                "execution_log": initial_exec_log,
-                "cyc_results": initial_results,
-                "initial_query_spec": initial_query_spec,
-            }
-            supplement_plan, supplement_results, supplement_exec_log, answer_signal = self._plan_and_execute_with_repairs(
-                user_prompt, initial_error_context=initial_error_context
-            )
-            used_plan = "supplement_plan"
-            plan = supplement_plan
-            results = supplement_results
-            exec_log = supplement_exec_log
-
-        if answer_signal is None:
-            # Defensive: should not happen because _plan_and_execute_with_repairs raises on failure.
-            raise NoAnswerError("No authoritative answer signal was produced by OpenCyc.")
-
-        self._progress("formatting answer...")
-        answer_json = self._generate_answer(user_prompt, results, exec_log, answer_signal)
-
-        # Store assistant answer in conversation
-        self.conversation.append({"role": "assistant", "content": answer_json["answer"]})
-
-        debug_blob = {
+        debug: Dict[str, Any] = {
             "session": {
                 "session_id": self.session_info.session_id,
                 "session_mt": self.session_info.session_mt,
                 "genl_mt": self.session_info.genl_mt,
             },
-            "used_plan": used_plan,
-            "initial_query": {
-                "query_spec": initial_query_spec,
-                "plan": initial_plan,
-                "execution_log": initial_exec_log,
-                "cyc_results": initial_results,
-                "answer_signal": None
-                if initial_answer_signal is None
-                else {
-                    "action_index": initial_answer_signal.action_index,
-                    "action_type": initial_answer_signal.action_type,
-                    "answer_text": initial_answer_signal.answer_text,
-                    "query": initial_answer_signal.query,
-                    "raw_value": initial_answer_signal.raw_value,
-                },
-            },
-            "supplement": None
-            if supplement_plan is None
-            else {
-                "plan": supplement_plan,
-                "execution_log": supplement_exec_log,
-                "cyc_results": supplement_results,
-            },
-            "plan": plan,
-            "execution_log": exec_log,
-            "cyc_results": results,
-            "answer_signal": {
-                "action_index": answer_signal.action_index,
-                "action_type": answer_signal.action_type,
-                "answer_text": answer_signal.answer_text,
-                "query": answer_signal.query,
-                "raw_value": answer_signal.raw_value,
-            },
-            "raw_answer_json": answer_json,
+            "prompt": user_prompt,
         }
 
+        self._progress("parsing English with CoreNLP and composing CycL...")
+        query_type, query_str, query_var = self._translate_to_query(user_prompt, debug_out=debug)
+
+        self._progress("querying OpenCyc...")
+        exec_log: List[Dict[str, Any]] = []
+        raw_value = self._execute_query_with_repairs(
+            query_type=query_type,
+            query=query_str,
+            var=query_var,
+            limit=int(self.settings.default_bindings_limit),
+            exec_log=exec_log,
+        )
+
+        self._progress("rendering result...")
+        answer, evidence, limitations = self._format_result(
+            query_type=query_type,
+            query=query_str,
+            var=query_var,
+            raw_value=raw_value,
+        )
+
+        debug["query"] = {
+            "query_type": query_type,
+            "query": query_str,
+            "var": query_var,
+        }
+        debug["execution_log"] = exec_log
+        debug["raw_value"] = raw_value
+
         return RunResult(
-            answer=answer_json["answer"],
-            cyc_evidence=answer_json.get("cyc_evidence", []),
-            limitations=answer_json.get("limitations", []),
-            debug=debug_blob,
+            answer=answer,
+            cyc_evidence=evidence,
+            limitations=limitations,
+            debug=debug,
         )
 
     # -----------------------------
-    # LLM calls (with tracing)
+    # Translation (English -> CycL)
     # -----------------------------
 
-    def _llm_chat_json(
+    def _translate_to_query(self, user_prompt: str, *, debug_out: Dict[str, Any]) -> Tuple[str, str, str]:
+        try:
+            ann = self._nlp.annotate(user_prompt)
+        except Exception as e:
+            raise TranslationError(f"CoreNLP annotate() failed: {e}") from e
+
+        try:
+            term: CycLTerm = self._translator.translate_annotation_term(ann)
+        except Exception as e:
+            raise TranslationError(f"CycL composition failed: {e}") from e
+
+        debug_out["raw_cycl_term"] = term
+        debug_out["raw_cycl"] = _E2C.cycl_to_string(term)
+
+        is_question = _looks_like_question(user_prompt)
+
+        # Determine if this is a WH-question with a target variable.
+        vars_in_term = _collect_vars(term)
+        wh_var = ""
+        for v in _WH_VAR_PRIORITY:
+            if v in vars_in_term:
+                wh_var = v
+                break
+
+        if wh_var:
+            # ask_var: make WH variable free and close any other free variables.
+            query_type = "ask_var"
+            query_var = wh_var
+            t2 = _drop_quantifier(term, wh_var)
+            t3 = _close_free_vars(t2, keep_free={wh_var})
+            query_str = _E2C.cycl_to_string(t3)
+            debug_out["cycl_rewrite"] = {
+                "wh_var": wh_var,
+                "after_drop_quantifier": _E2C.cycl_to_string(t2),
+                "after_close_free_vars": query_str,
+                "free_vars_after": sorted(_free_vars(t3)),
+            }
+            return query_type, query_str, query_var
+
+        # Default: yes/no or declarative -> ask_true (closed).
+        query_type = "ask_true" if is_question else "ask_true"
+        t2 = _close_free_vars(term, keep_free=set())
+        query_str = _E2C.cycl_to_string(t2)
+        debug_out["cycl_rewrite"] = {
+            "wh_var": None,
+            "after_close_free_vars": query_str,
+            "free_vars_after": sorted(_free_vars(t2)),
+        }
+        return query_type, query_str, ""
+
+    # -----------------------------
+    # Execution + repairs
+    # -----------------------------
+
+    def _execute_query_with_repairs(
         self,
         *,
-        kind: str,
-        messages: List[Dict[str, Any]],
-        schema: Dict[str, Any],
-        options: Optional[Dict[str, Any]] = None,
+        query_type: str,
+        query: str,
+        var: str,
+        limit: int,
+        exec_log: List[Dict[str, Any]],
     ) -> Any:
-        options = options or {"temperature": self.settings.ollama_temperature}
+        repairs = 0
 
-        trace = self.trace
-        call_id = uuid.uuid4().hex
-        stream = trace is not None
-
-        if trace is not None:
-            trace.write(
-                "llm_call_start",
-                call_id=call_id,
-                kind=kind,
-                model=self.settings.ollama_model,
-                stream=stream,
-                options=options,
-                messages=messages,
-                schema=schema,
-            )
-
-        delta_counter = {"i": 0}
-
-        def on_chunk(chunk: Dict[str, Any], i: int) -> None:
-            if trace is None:
-                return
-            # log the raw chunk (includes done/usage timings)
-            trace.write("llm_call_chunk", call_id=call_id, i=i, chunk=chunk)
-            msg = chunk.get("message", {}) or {}
-            delta = msg.get("content", "")
-            if isinstance(delta, str) and delta:
-                trace.write(
-                    "llm_call_delta",
-                    call_id=call_id,
-                    i=delta_counter["i"],
-                    delta=delta,
-                    done=bool(chunk.get("done", False)),
-                )
-                delta_counter["i"] += 1
-
-        try:
-            raw = self.ollama.chat_text(
-                model=self.settings.ollama_model,
-                messages=messages,
-                format=schema,
-                options=options,
-                stream=stream,
-                on_chunk=on_chunk,
-            )
-        except Exception as e:
-            if trace is not None:
-                trace.write(
-                    "llm_call_error",
-                    call_id=call_id,
-                    kind=kind,
-                    error_type=e.__class__.__name__,
-                    error=str(e),
-                )
-            raise
-
-        if trace is not None:
-            trace.write("llm_call_complete", call_id=call_id, kind=kind, raw=raw)
-
-        parsed = None
-        try:
-            parsed = _parse_jsonish(raw)
-        except Exception as e:
-            if trace is not None:
-                trace.write(
-                    "llm_call_parse_error",
-                    call_id=call_id,
-                    kind=kind,
-                    error_type=e.__class__.__name__,
-                    error=str(e),
-                    raw=raw[:2000],
-                )
-            raise
-
-        if trace is not None:
-            trace.write("llm_call_parsed", call_id=call_id, kind=kind, parsed=parsed)
-
-        return parsed
-
-    # -----------------------------
-    # Planning + execution
-    # -----------------------------
-
-    # -----------------------------
-    # Query-first execution (no pre-asserts)
-    # -----------------------------
-
-    def _translate_and_execute_initial_query(
-        self, user_prompt: str
-    ) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any], List[Dict[str, Any]], Optional[AnswerSignal]]:
-        """Translate the prompt into a single CycL query and run it.
-
-        If OpenCyc complains about undefined terms, we define those terms in the session MT and retry.
-        This avoids pre-emptive assertion and relies on OpenCyc to tell us what is missing.
-        """
-
-        # We build a dynamic plan that records every attempted action (failed queries, repairs, retries)
-        plan: Dict[str, Any] = {
-            "session_mt": self.ctx.session_mt,
-            "actions": [],
-            "final_response_instructions": "",
-        }
-        results: Dict[str, Any] = {
-            "session_mt": self.ctx.session_mt,
-            "actions": [],
-        }
-        exec_log: List[Dict[str, Any]] = []
-
-        query_spec: Optional[Dict[str, Any]] = None
-        translate_attempt = 0
-        define_attempt = 0
-        max_translate_attempts = self.settings.max_plan_retries + 1
-        max_define_attempts = 20
-
-        feedback: Optional[str] = None
-
-        # Initial translation
-        while query_spec is None:
-            if translate_attempt >= max_translate_attempts:
-                raise PlanValidationError("Failed to translate prompt into a valid CycL query.")
-            query_spec = self._translate_query_spec(user_prompt, feedback=feedback)
-            try:
-                query_spec = self._validate_and_normalize_query_spec(query_spec)
-            except PlanValidationError as e:
-                translate_attempt += 1
-                feedback = str(e)
-                query_spec = None
-
-        # Execute with iterative repairs
         while True:
-            action = self._query_spec_to_action(query_spec)
-            idx = len(plan["actions"])
-            plan["actions"].append(action)
-
             try:
-                self._progress("querying OpenCyc KB...")
-                self._execute_single_action(idx, action, results=results, exec_log=exec_log)
+                if query_type == "ask_true":
+                    ans = self.cyc.ask_true(mt=self.session_info.session_mt, query=query)
+                    exec_log.append({"type": "ask_true", "mt": self.session_info.session_mt, "query": query, "answer": ans})
+                    return bool(ans)
+
+                if query_type == "ask_var":
+                    if not var or not var.startswith("?"):
+                        raise TranslationError(f"ask_var requires a variable like '?X', got: {var!r}")
+                    bindings = self.cyc.ask_var(
+                        mt=self.session_info.session_mt,
+                        query=query,
+                        var=var,
+                        limit=int(limit),
+                    )
+                    exec_log.append(
+                        {
+                            "type": "ask_var",
+                            "mt": self.session_info.session_mt,
+                            "query": query,
+                            "var": var,
+                            "limit": int(limit),
+                            "bindings": bindings,
+                        }
+                    )
+                    return bindings
+
+                raise RuntimeError(f"Unknown query_type: {query_type}")
+
             except CycBridgeError as e:
                 msg = e.server_message
+                exec_log.append({"type": "cyc_error", "message": msg})
 
-                # Identify missing constants (if any) from the Cyc error message.
-                consts = sorted(_extract_constants(msg))
+                # Try to auto-repair missing constants.
+                missing = sorted(set(_extract_constants(msg)))
+                if not missing:
+                    raise
 
                 safe_missing: List[str] = []
-                unsafe_missing: List[str] = []
-                for tok in consts:
+                for tok in missing:
                     bare = tok[2:] if tok.startswith("#$") else tok
                     if not bare:
                         continue
                     try:
                         exists = self.cyc.constant_exists(bare)
                     except CycBridgeError:
-                        # If we can't check existence, treat as unsafe and let re-translation handle it.
-                        unsafe_missing.append(tok)
+                        # If we can't check existence, treat it as non-repairable.
                         continue
                     if exists:
                         continue
                     if self._safe_to_autocreate_constant(tok):
                         safe_missing.append(tok)
-                    else:
-                        unsafe_missing.append(tok)
 
-                if safe_missing:
-                    define_attempt += 1
-                    if define_attempt > max_define_attempts:
-                        raise PlanExecutionError(
-                            f"Exceeded maximum missing-term repair attempts ({max_define_attempts}). Last error: {msg}"
-                        )
+                if not safe_missing:
+                    raise
 
-                    self._progress("defining missing terms in session MT...")
-                    def_actions = self._build_definition_actions(missing_constants=safe_missing, query=query_spec["query"])
-                    for a in def_actions:
-                        a["mt"] = self.ctx.session_mt
-                        a_idx = len(plan["actions"])
-                        plan["actions"].append(a)
-                        self._execute_single_action(a_idx, a, results=results, exec_log=exec_log)
+                repairs += 1
+                if repairs > int(self.settings.max_missing_term_repairs):
+                    raise RuntimeError(
+                        f"Exceeded MAX_MISSING_TERM_REPAIRS={self.settings.max_missing_term_repairs}. Last error: {msg}"
+                    ) from e
 
-                    # Retry the same query after definitions.
-                    continue
-
-                # If we have only "unsafe" missing terms (often a wrong built-in predicate like #$eq),
-                # treat this as a translation error and ask the LLM to re-translate.
-                translate_attempt += 1
-                if translate_attempt >= max_translate_attempts:
-                    raise PlanExecutionError(
-                        f"OpenCyc rejected the translated query and we exhausted translation retries. Last error: {msg}"
-                    )
-
-                feedback_obj = {
-                    "cyc_error": msg,
-                    "previous_query": query_spec.get("query"),
-                    "notes": "If you used a predicate that OpenCyc doesn't recognize (e.g., #$eq), replace it with a real Cyc predicate; do not invent new lowercase predicates.",
-                }
-                feedback = json.dumps(feedback_obj, indent=2)
-                self._progress("refining CycL translation after OpenCyc error...")
-                query_spec = self._translate_query_spec(user_prompt, feedback=feedback)
-                query_spec = self._validate_and_normalize_query_spec(query_spec)
-                continue
-
-            # Query succeeded (even if no bindings)
-            answer_signal = self._extract_answer_signal(plan, results)
-            return query_spec, plan, results, exec_log, answer_signal
-
-    def _translate_query_spec(self, user_prompt: str, *, feedback: Optional[str] = None) -> Dict[str, Any]:
-        prompt = user_prompt
-        if feedback:
-            prompt = f"{user_prompt}\n\nTRANSLATION FEEDBACK (fix and try again):\n{feedback}"
-
-        messages = build_query_messages(
-            ctx=self.ctx,
-            user_prompt=prompt,
-            conversation=self.conversation,
-        )
-        spec = self._llm_chat_json(kind="translator", messages=messages, schema=query_json_schema())
-        if not isinstance(spec, dict):
-            raise PlanValidationError(f"Translator returned non-object JSON: {type(spec)}")
-        return spec
-
-    def _validate_and_normalize_query_spec(self, spec: Dict[str, Any]) -> Dict[str, Any]:
-        qt = (spec.get("query_type") or "").strip()
-        if qt not in ("ask_var", "ask_true"):
-            raise PlanValidationError("Query spec must set query_type to ask_var or ask_true")
-
-        query = str(spec.get("query") or "").strip()
-        if not query:
-            raise PlanValidationError("Query spec must include non-empty 'query'")
-        if not _is_single_toplevel_cycl_form(query):
-            raise PlanValidationError(
-                "Query must be a single fully parenthesized CycL form starting with '(#$' and ending with ')'."
-            )
-        if query.startswith("(#$ist"):
-            raise PlanValidationError("Do not use #$ist in queries; mt is provided separately.")
-
-        var = str(spec.get("var") or "").strip()
-        limit_raw = spec.get("limit")
-        try:
-            limit = int(limit_raw) if limit_raw is not None else self.settings.default_bindings_limit
-        except Exception:
-            limit = self.settings.default_bindings_limit
-
-        if qt == "ask_var":
-            if not var:
-                var = "?X"
-            if not var.startswith("?"):
-                raise PlanValidationError("ask_var requires 'var' to start with '?' (e.g., ?X)")
-            if var not in query:
-                raise PlanValidationError("ask_var variable must appear in the query string")
-            if limit <= 0:
-                limit = self.settings.default_bindings_limit
-        else:
-            # ask_true
-            var = ""
-            limit = 0
-
-        return {
-            "query_type": qt,
-            "query": query,
-            "var": var,
-            "limit": limit,
-            "analysis_summary": str(spec.get("analysis_summary") or "").strip(),
-        }
-
-    def _query_spec_to_action(self, spec: Dict[str, Any]) -> Dict[str, Any]:
-        qt = spec["query_type"]
-        if qt == "ask_true":
-            return {
-                "type": "ask_true",
-                "query": spec["query"],
-                "mt": self.ctx.session_mt,
-            }
-        return {
-            "type": "ask_var",
-            "query": spec["query"],
-            "var": spec.get("var") or "?X",
-            "limit": int(spec.get("limit") or self.settings.default_bindings_limit),
-            "mt": self.ctx.session_mt,
-        }
+                self._progress("defining missing constants in session MT...")
+                self._define_missing_constants(safe_missing, query=query, exec_log=exec_log)
+                # retry
 
     def _safe_to_autocreate_constant(self, const_tok: str) -> bool:
-        """Heuristic: only auto-create CamelCase (or digit-starting) constants.
-
-        If a missing constant starts with a lowercase letter (e.g., #$eq), that's often a mistaken built-in
-        predicate/function name and should be fixed by re-translation, not by minting a new constant.
-        """
         if not const_tok.startswith("#$") or len(const_tok) < 3:
             return False
         c0 = const_tok[2]
         return c0.isupper() or c0.isdigit()
 
-    def _build_definition_actions(self, *, missing_constants: List[str], query: str) -> List[Dict[str, Any]]:
-        actions: List[Dict[str, Any]] = []
-        seen: set[str] = set()
+    def _define_missing_constants(self, missing_constants: Sequence[str], *, query: str, exec_log: List[Dict[str, Any]]) -> None:
+        seen: Set[str] = set()
 
         for tok in missing_constants:
             if tok in seen:
                 continue
             seen.add(tok)
+
             bare = tok[2:] if tok.startswith("#$") else tok
             if not bare:
                 continue
 
-            # 1) Ensure the constant exists.
-            actions.append({"type": "ensure_term", "name": bare})
-
-            # 2) Assert a minimal definition.
-            arities = self._find_head_arities(query, tok)
-            if arities:
-                arity = max(arities)
-                pred_type = {
-                    1: "#$UnaryPredicate",
-                    2: "#$BinaryPredicate",
-                    3: "#$TernaryPredicate",
-                    4: "#$QuaternaryPredicate",
-                }.get(arity, "#$Predicate")
-                actions.append({"type": "assert", "sentence": f"(#$isa {tok} {pred_type})"})
-            else:
-                actions.append({"type": "assert", "sentence": f"(#$isa {tok} #$Thing)"})
-
-        return actions
-
-    def _find_head_arities(self, expr: str, target_head: str) -> set[int]:
-        """Return the set of arities where target_head appears as the head of a list in expr."""
-        arities: set[int] = set()
-        self._find_head_arities_rec(expr, target_head, arities)
-        return arities
-
-    def _find_head_arities_rec(self, expr: str, target_head: str, out: set[int]) -> None:
-        tokens = _split_top_level_sexp(expr)
-        if not tokens:
-            return
-        head = tokens[0]
-        if head == target_head:
-            out.add(max(0, len(tokens) - 1))
-        for tok in tokens[1:]:
-            if tok.startswith("(") and tok.endswith(")"):
-                self._find_head_arities_rec(tok, target_head, out)
-
-    def _execute_single_action(
-        self,
-        idx: int,
-        action: Dict[str, Any],
-        *,
-        results: Dict[str, Any],
-        exec_log: List[Dict[str, Any]],
-    ) -> None:
-        """Execute a single action and log it, re-raising original exceptions.
-
-        This is used in the query-first loop so we can catch CycBridgeError directly and perform
-        missing-term repairs, while still recording a full action trace.
-        """
-
-        atype = (action.get("type") or "").strip()
-        mt = self.ctx.session_mt
-        entry: Dict[str, Any] = {"i": idx, "type": atype, "mt": mt}
-
-        if self.trace is not None:
-            self.trace.write("cyc_action_start", i=idx, type=atype, action=action)
-
-        try:
-            if atype == "ensure_term":
-                name = (action.get("name") or "").strip()
-                if not name:
-                    raise PlanExecutionError("ensure_term missing name")
-
-                exists = self.cyc.constant_exists(name)
-                entry["name"] = name
-                entry["exists"] = exists
-                if not exists:
-                    created = self.cyc.create_constant(name)
-                    entry["created"] = created
-
-            elif atype == "assert":
-                sentence = (action.get("sentence") or "").strip()
-                if not sentence:
-                    raise PlanExecutionError("assert missing sentence")
-                self.cyc.assert_sentence(mt=mt, sentence=sentence)
-                entry["sentence"] = sentence
-                entry["ok"] = True
-
-            elif atype == "ask_true":
-                query = (action.get("query") or "").strip()
-                if not query:
-                    raise PlanExecutionError("ask_true missing query")
-                ans = self.cyc.ask_true(mt=mt, query=query)
-                entry["query"] = query
-                entry["answer"] = ans
-
-            elif atype == "ask_var":
-                query = (action.get("query") or "").strip()
-                var = (action.get("var") or "?X").strip() or "?X"
-                limit = action.get("limit")
-                if limit is None:
-                    limit = self.settings.default_bindings_limit
-                else:
-                    try:
-                        limit = int(limit)
-                    except Exception:
-                        limit = self.settings.default_bindings_limit
-                if not query:
-                    raise PlanExecutionError("ask_var missing query")
-                bindings = self.cyc.ask_var(mt=mt, query=query, var=var, limit=limit)
-                entry["query"] = query
-                entry["var"] = var
-                entry["limit"] = limit
-                entry["bindings"] = bindings
-
-            else:
-                raise PlanExecutionError(f"Unknown action type: {atype}")
-
-            # success
-            results["actions"].append(entry)
-            exec_log.append(entry)
-
-        except Exception as e:
-            entry["error"] = str(e)
-            results["actions"].append(entry)
-            exec_log.append(entry)
-            raise
-
-        finally:
-            if self.trace is not None:
-                self.trace.write("cyc_action_end", i=idx, type=atype, entry=entry)
-
-    def _plan_and_execute_with_repairs(
-        self,
-        user_prompt: str,
-        *,
-        initial_error_context: Optional[Dict[str, Any]] = None,
-    ) -> Tuple[Dict[str, Any], Dict[str, Any], List[Dict[str, Any]], AnswerSignal]:
-        error_context: Optional[Dict[str, Any]] = initial_error_context
-        last_exception: Optional[Exception] = None
-
-        for attempt in range(self.settings.max_plan_retries + 1):
-            if self.trace is not None:
-                self.trace.write("plan_attempt_start", attempt=attempt, error_context=_slim_error_context(error_context))
-
-            exec_log: List[Dict[str, Any]] = []
-            plan: Optional[Dict[str, Any]] = None
-            results: Optional[Dict[str, Any]] = None
+            # Ensure the constant exists.
             try:
-                self._progress(f"planning (attempt {attempt + 1}/{self.settings.max_plan_retries + 1})...")
-                plan = self._generate_plan(user_prompt, error_context=error_context)
-
-                self._progress("checking OpenCyc KB...")
-                results = self._execute_plan(plan, exec_log=exec_log)
-
-                answer_signal = self._extract_answer_signal(plan, results)
-                if answer_signal is None:
-                    raise NoAnswerError("OpenCyc returned no bindings for the final query.")
-
-                if self.trace is not None:
-                    self.trace.write("plan_attempt_succeeded", attempt=attempt)
-                return plan, results, exec_log, answer_signal
-
-            except (PlanValidationError, PlanExecutionError, NoAnswerError, CycBridgeError, OllamaError, Exception) as e:
-                last_exception = e
-
-                error_context = {
-                    "attempt": attempt,
-                    "error_type": e.__class__.__name__,
-                    "error": str(e),
-                    "plan": plan,
-                    "execution_log": exec_log,
-                    "cyc_results": results,
-                }
-
-                if self.trace is not None:
-                    self.trace.write(
-                        "plan_attempt_failed",
-                        attempt=attempt,
-                        error_type=e.__class__.__name__,
-                        error=str(e),
-                    )
-
-        raise RuntimeError(
-            f"Failed after {self.settings.max_plan_retries + 1} attempts. Last error: {last_exception}"
-        )
-
-    def _generate_plan(self, user_prompt: str, error_context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        allow_converse = bool(self.allow_converse)
-        prompt = user_prompt if error_context is None else _augment_prompt_with_error(user_prompt, error_context)
-
-        messages = build_planner_messages(
-            ctx=self.ctx,
-            user_prompt=prompt,
-            conversation=self.conversation,
-            allow_converse=allow_converse,
-        )
-
-        plan = self._llm_chat_json(kind="planner", messages=messages, schema=plan_json_schema())
-
-        if not isinstance(plan, dict):
-            raise PlanValidationError(f"Planner returned non-object JSON: {type(plan)}")
-
-        # Force session_mt to our current mt
-        plan["session_mt"] = self.ctx.session_mt
-
-        actions = plan.get("actions", [])
-        if not isinstance(actions, list) or not actions:
-            raise PlanValidationError("Planner returned empty/non-list 'actions'")
-
-        normalized_actions: List[Dict[str, Any]] = []
-        for a in actions:
-            if not isinstance(a, dict):
-                continue
-            t = (a.get("type") or "").strip()
-            if not t:
+                created_name = self.cyc.create_constant(bare)
+                exec_log.append({"type": "ensure_term", "name": bare, "created": created_name})
+            except CycBridgeError as e:
+                exec_log.append({"type": "ensure_term", "name": bare, "error": e.server_message})
                 continue
 
-            if t == "converse" and not allow_converse:
-                continue
+            # Assert a minimal type in the session MT (helps Cyc accept some queries).
+            try:
+                arities = _find_head_arities(query, tok)
+                if arities:
+                    arity = max(arities)
+                    pred_type = {
+                        1: "#$UnaryPredicate",
+                        2: "#$BinaryPredicate",
+                        3: "#$TernaryPredicate",
+                        4: "#$QuaternaryPredicate",
+                    }.get(arity, "#$Predicate")
+                    sent = f"(#$isa {tok} {pred_type})"
+                else:
+                    sent = f"(#$isa {tok} #$Thing)"
 
-            # Normalize mt to session mt for all non-converse actions
-            if t != "converse":
-                a["mt"] = self.ctx.session_mt
+                self.cyc.assert_sentence(mt=self.session_info.session_mt, sentence=sent)
+                exec_log.append({"type": "assert", "mt": self.session_info.session_mt, "sentence": sent})
+            except CycBridgeError as e:
+                exec_log.append({"type": "assert", "mt": self.session_info.session_mt, "sentence": sent, "error": e.server_message})
 
-            # Validate/normalize action-specific fields
-            normalized_actions.append(self._validate_and_normalize_action(a))
+    # -----------------------------
+    # Natural-language rendering
+    # -----------------------------
 
-        if not normalized_actions:
-            raise PlanValidationError("All actions were filtered out during normalization.")
+    def _term_to_english(self, term_str: str) -> str:
+        t = (term_str or "").strip()
+        if not t:
+            return t
 
-        # Must end with ask_var/ask_true so the final value comes from OpenCyc
-        final_type = (normalized_actions[-1].get("type") or "").strip()
-        if final_type not in ("ask_var", "ask_true"):
-            raise PlanValidationError("Plan must end with an ask_var or ask_true action.")
+        if _is_int_literal(t):
+            return t
+        if t.startswith('"') and t.endswith('"'):
+            return _unquote_cyc_string(t)
 
-        # Deterministic rewrites to address common planner mistakes:
-        # - model puts typing facts in ensure_term.sentence (we promote those into assert actions)
-        # - missing ensure_term for referenced constants (we auto-insert ensures before use)
-        # - swapped subject/predicate in scalar assertions (heuristic based on final ask_var)
-        rewritten_actions, rewrite_info = self._rewrite_actions_for_execution(normalized_actions)
-        normalized_actions = rewritten_actions
+        if not self.settings.use_cyc_nl:
+            return t
 
-        if self.trace is not None:
-            self.trace.write("plan_rewrite", **rewrite_info)
-
-        # Ensure ensure_term constants are not placeholders and are actually used
-        self._validate_ensure_terms_used(normalized_actions)
-
-        plan["actions"] = normalized_actions
-        return plan
-
-    def _validate_and_normalize_action(self, action: Dict[str, Any]) -> Dict[str, Any]:
-        t = (action.get("type") or "").strip()
-
-        if t == "ensure_term":
-            name = (action.get("name") or "").strip()
-            if not name:
-                raise PlanValidationError("ensure_term missing 'name'")
-            bare = name[2:] if name.startswith("#$") else name
-            if bare.lower().startswith("ensure_"):
-                raise PlanValidationError(
-                    f"ensure_term name '{name}' looks like a placeholder. Use the actual constant name (CamelCase), not 'ensure_*'."
-                )
-            action["name"] = name
-            return action
-
-        if t == "assert":
-            sentence = (action.get("sentence") or "").strip()
-            if not sentence:
-                raise PlanValidationError("assert missing 'sentence'")
-            if not _is_single_toplevel_cycl_form(sentence):
-                raise PlanValidationError(
-                    f"assert sentence must be fully parenthesized CycL, got: {sentence[:120]}"
-                )
-            action["sentence"] = sentence
-            return action
-
-        if t == "ask_true":
-            query = (action.get("query") or "").strip()
-            if not query:
-                raise PlanValidationError("ask_true missing 'query'")
-            if not _is_single_toplevel_cycl_form(query):
-                raise PlanValidationError(
-                    f"ask_true query must be fully parenthesized CycL, got: {query[:120]}"
-                )
-            action["query"] = query
-            return action
-
-        if t == "ask_var":
-            query = (action.get("query") or "").strip()
-            var = (action.get("var") or "?X").strip() or "?X"
-            limit = action.get("limit")
-            if limit is None:
-                limit = self.settings.default_bindings_limit
-            else:
+        # Constants are the easy/common case.
+        if t.startswith("#$"):
+            for pred in _NL_STRING_PREDICATES:
+                q = f"({pred} {t} ?S)"
                 try:
-                    limit = int(limit)
+                    vals = self.cyc.ask_var(mt=self._nl_mt, query=q, var="?S", limit=1)
                 except Exception:
-                    limit = self.settings.default_bindings_limit
-            if limit <= 0:
-                limit = self.settings.default_bindings_limit
+                    vals = []
+                if vals:
+                    s = _unquote_cyc_string(vals[0])
+                    if s:
+                        return s
 
-            if not query:
-                raise PlanValidationError("ask_var missing 'query'")
-            if not _is_single_toplevel_cycl_form(query):
-                raise PlanValidationError(
-                    f"ask_var query must be fully parenthesized CycL, got: {query[:120]}"
-                )
-            if not var.startswith("?"):
-                raise PlanValidationError(f"ask_var var must start with '?', got: {var}")
-            if var not in query:
-                raise PlanValidationError(
-                    f"ask_var var '{var}' must appear in query. query={query[:160]}"
-                )
+        return t
 
-            action["query"] = query
-            action["var"] = var
-            action["limit"] = limit
-            return action
-
-        if t == "converse":
-            subl = (action.get("subl") or "").strip()
-            if not subl:
-                raise PlanValidationError("converse missing 'subl'")
-            action["subl"] = subl
-            return action
-
-        raise PlanValidationError(f"Unknown action type: {t}")
-
-    def _validate_ensure_terms_used(self, actions: List[Dict[str, Any]]) -> None:
-        # For each ensure_term, require that its constant is referenced in a later assert/query.
-        for i, a in enumerate(actions):
-            if (a.get("type") or "").strip() != "ensure_term":
-                continue
-            name = (a.get("name") or "").strip()
-            if not name:
-                continue
-            norm = _normalize_constant_ref(name)
-            used = False
-            for b in actions[i + 1 :]:
-                t = (b.get("type") or "").strip()
-                hay = ""
-                if t == "assert":
-                    hay = str(b.get("sentence") or "")
-                elif t in ("ask_true", "ask_var"):
-                    hay = str(b.get("query") or "")
-                if norm and norm in hay:
-                    used = True
-                    break
-            if not used:
-                raise PlanValidationError(
-                    f"ensure_term constant {norm} is never used later in the plan. Avoid unused placeholders."
-                )
-
-
-    def _rewrite_actions_for_execution(
-        self, actions: List[Dict[str, Any]]
-    ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-        """Apply deterministic rewrites to make LLM plans executable/reliable.
-
-        These rewrites are intentionally conservative and only target common failure modes
-        observed in traces:
-        - putting CycL typing facts in ensure_term.sentence (ignored by executor) instead of assert
-        - referencing constants in sentences/queries without ensuring they exist
-        - accidentally swapping the subject/predicate when asserting a scalar value
-        """
-
-        info: Dict[str, Any] = {
-            "promoted_ensure_term_sentences": 0,
-            "auto_ensures_inserted": 0,
-            "dropped_duplicate_ensures": 0,
-            "dropped_unused_ensures": 0,
-            "heuristic_rewrites": 0,
-        }
-
-        # 1) Promote ensure_term.sentence -> assert immediately after the ensure_term.
-        expanded: List[Dict[str, Any]] = []
-        for a in actions:
-            t = (a.get("type") or "").strip()
-            if t == "ensure_term":
-                sent = (a.get("sentence") or "").strip()
-                a2 = dict(a)
-                # ensure_term executor ignores 'sentence' anyway; remove to avoid confusion.
-                if "sentence" in a2:
-                    a2.pop("sentence", None)
-                expanded.append(a2)
-
-                # If the model supplied a CycL sentence, treat it as an assert.
-                if sent and _is_single_toplevel_cycl_form(sent):
-                    expanded.append(
-                        {
-                            "type": "assert",
-                            "sentence": sent,
-                            "mt": self.ctx.session_mt,
-                        }
-                    )
-                    info["promoted_ensure_term_sentences"] += 1
-                continue
-
-            expanded.append(a)
-
-        actions = expanded
-
-        # 2) Fix a common inversion: assert (Subject 79) when final query is (Predicate Subject ?N)
-        actions, fixed = self._heuristic_fix_inverted_scalar_assert(actions)
-        info["heuristic_rewrites"] += fixed
-
-        # 3) Auto-insert ensure_term actions for any referenced constants that are not ensured yet.
-        actions, inserted, dropped_dups = self._auto_ensure_constants(actions)
-        info["auto_ensures_inserted"] = inserted
-        info["dropped_duplicate_ensures"] = dropped_dups
-
-        # 4) Drop ensure_term actions that appear after all uses (helps keep plans small and avoids validation noise)
-        actions, dropped_unused = self._drop_unused_ensure_terms(actions)
-        info["dropped_unused_ensures"] = dropped_unused
-
-        # 5) Final pass: normalize mt and validate inserted actions
-        normalized: List[Dict[str, Any]] = []
-        for a in actions:
-            t = (a.get("type") or "").strip()
-            if t and t != "converse":
-                a["mt"] = self.ctx.session_mt
-            normalized.append(self._validate_and_normalize_action(a))
-
-        return normalized, info
-
-    def _heuristic_fix_inverted_scalar_assert(
-        self, actions: List[Dict[str, Any]]
-    ) -> Tuple[List[Dict[str, Any]], int]:
-        """Heuristic rewrite:
-        If the final action is ask_var with query like (P S ?N), and there is an assert like (S 79),
-        rewrite that assert into (P S 79).
-        """
-        if not actions:
-            return actions, 0
-        final = actions[-1]
-        if (final.get("type") or "").strip() != "ask_var":
-            return actions, 0
-
-        query = (final.get("query") or "").strip()
-        var = ((final.get("var") or "?X").strip() or "?X")
-        qtoks = _split_top_level_sexp(query)
-        if len(qtoks) < 3:
-            return actions, 0
-
-        pred = qtoks[0]
-        if not pred.startswith("#$"):
-            return actions, 0
-
-        subject: Optional[str] = None
-        for tok in qtoks[1:]:
-            if tok == var:
-                continue
-            if tok.startswith("#$"):
-                subject = tok
-                break
-        if subject is None:
-            return actions, 0
-
-        fixed = 0
-        out: List[Dict[str, Any]] = []
-        for a in actions:
-            if (a.get("type") or "").strip() == "assert":
-                sent = (a.get("sentence") or "").strip()
-                toks = _split_top_level_sexp(sent)
-                if len(toks) == 2 and toks[0] == subject and _is_int_literal(toks[1]):
-                    a2 = dict(a)
-                    a2["sentence"] = f"({pred} {subject} {toks[1]})"
-                    out.append(a2)
-                    fixed += 1
-                    continue
-            out.append(a)
-
-        return out, fixed
-
-    def _auto_ensure_constants(
-        self, actions: List[Dict[str, Any]]
-    ) -> Tuple[List[Dict[str, Any]], int, int]:
-        """Insert ensure_term actions before first use of each referenced constant."""
-        ensured: set[str] = set()
-        out: List[Dict[str, Any]] = []
-        inserted = 0
-        dropped_dups = 0
-
-        def ensure_const(const_tok: str) -> None:
-            nonlocal inserted
-            if not const_tok or not const_tok.startswith("#$"):
-                return
-            # session mts are created up-front; no need to ensure again
-            if const_tok.startswith("#$CycLLMSessionMt_"):
-                ensured.add(const_tok)
-                return
-            if const_tok in ensured:
-                return
-            out.append({"type": "ensure_term", "name": const_tok[2:], "mt": self.ctx.session_mt})
-            ensured.add(const_tok)
-            inserted += 1
-
-        for a in actions:
-            t = (a.get("type") or "").strip()
-
-            if t == "ensure_term":
-                name = (a.get("name") or "").strip()
-                if not name:
-                    out.append(a)
-                    continue
-                norm = _normalize_constant_ref(name)
-                if norm in ensured:
-                    dropped_dups += 1
-                    continue
-                # Normalize name to bare form (no '#$') for the tool call
-                a2 = dict(a)
-                a2["name"] = name[2:] if name.startswith("#$") else name
-                out.append(a2)
-                ensured.add(norm)
-                continue
-
-            refs: List[str] = []
-            if t == "assert":
-                refs = _extract_constants(str(a.get("sentence") or ""))
-            elif t in ("ask_true", "ask_var"):
-                refs = _extract_constants(str(a.get("query") or ""))
-
-            for c in sorted(set(refs)):
-                ensure_const(c)
-
-            out.append(a)
-
-        return out, inserted, dropped_dups
-
-    def _drop_unused_ensure_terms(self, actions: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], int]:
-        """Remove ensure_term actions that are never referenced after their position."""
-        needed: set[str] = set()
-        kept_rev: List[Dict[str, Any]] = []
-        dropped = 0
-
-        for a in reversed(actions):
-            t = (a.get("type") or "").strip()
-
-            if t == "ensure_term":
-                name = (a.get("name") or "").strip()
-                norm = _normalize_constant_ref(name)
-                if norm in needed:
-                    kept_rev.append(a)
-                else:
-                    dropped += 1
-                continue
-
-            if t == "assert":
-                needed.update(_extract_constants(str(a.get("sentence") or "")))
-            elif t in ("ask_true", "ask_var"):
-                needed.update(_extract_constants(str(a.get("query") or "")))
-
-            kept_rev.append(a)
-
-        kept = list(reversed(kept_rev))
-        return kept, dropped
-
-
-    def _execute_plan(self, plan: Dict[str, Any], exec_log: List[Dict[str, Any]]) -> Dict[str, Any]:
-        results: Dict[str, Any] = {
-            "session_mt": self.ctx.session_mt,
-            "actions": [],
-        }
-
-        actions = plan.get("actions", []) or []
-        for idx, action in enumerate(actions):
-            atype = (action.get("type") or "").strip()
-            mt = self.ctx.session_mt
-            entry: Dict[str, Any] = {"i": idx, "type": atype, "mt": mt}
-
-            if self.trace is not None:
-                self.trace.write("cyc_action_start", i=idx, type=atype, action=action)
-
-            try:
-                if atype == "ensure_term":
-                    name = (action.get("name") or "").strip()
-                    if not name:
-                        entry["error"] = "Missing name"
-                        results["actions"].append(entry)
-                        exec_log.append(entry)
-                        raise PlanExecutionError("ensure_term missing name")
-
-                    self._progress(f"ensuring term: {name}")
-                    exists = self.cyc.constant_exists(name)
-                    entry["name"] = name
-                    entry["exists"] = exists
-                    if not exists:
-                        created = self.cyc.create_constant(name)
-                        entry["created"] = created
-                    results["actions"].append(entry)
-                    exec_log.append(entry)
-                    continue
-
-                if atype == "assert":
-                    sentence = (action.get("sentence") or "").strip()
-                    if not sentence:
-                        entry["error"] = "Missing sentence"
-                        results["actions"].append(entry)
-                        exec_log.append(entry)
-                        raise PlanExecutionError("assert missing sentence")
-
-                    self._progress("asserting fact in session MT...")
-                    self.cyc.assert_sentence(mt=mt, sentence=sentence)
-                    entry["sentence"] = sentence
-                    entry["ok"] = True
-                    results["actions"].append(entry)
-                    exec_log.append(entry)
-                    continue
-
-                if atype == "ask_true":
-                    query = (action.get("query") or "").strip()
-                    if not query:
-                        entry["error"] = "Missing query"
-                        results["actions"].append(entry)
-                        exec_log.append(entry)
-                        raise PlanExecutionError("ask_true missing query")
-
-                    self._progress("querying OpenCyc...")
-                    ans = self.cyc.ask_true(mt=mt, query=query)
-                    entry["query"] = query
-                    entry["answer"] = ans
-                    results["actions"].append(entry)
-                    exec_log.append(entry)
-                    continue
-
-                if atype == "ask_var":
-                    query = (action.get("query") or "").strip()
-                    var = (action.get("var") or "?X").strip() or "?X"
-                    limit = action.get("limit")
-                    if limit is None:
-                        limit = self.settings.default_bindings_limit
-                    else:
-                        try:
-                            limit = int(limit)
-                        except Exception:
-                            limit = self.settings.default_bindings_limit
-
-                    if not query:
-                        entry["error"] = "Missing query"
-                        results["actions"].append(entry)
-                        exec_log.append(entry)
-                        raise PlanExecutionError("ask_var missing query")
-
-                    self._progress("querying OpenCyc...")
-                    bindings = self.cyc.ask_var(mt=mt, query=query, var=var, limit=limit)
-                    entry["query"] = query
-                    entry["var"] = var
-                    entry["limit"] = limit
-                    entry["bindings"] = bindings
-                    results["actions"].append(entry)
-                    exec_log.append(entry)
-                    continue
-
-                if atype == "converse":
-                    subl = (action.get("subl") or "").strip()
-                    if not subl:
-                        entry["error"] = "Missing subl"
-                        results["actions"].append(entry)
-                        exec_log.append(entry)
-                        raise PlanExecutionError("converse missing subl")
-                    self._progress("running SubL...")
-                    out = self.cyc.converse(subl=subl)
-                    entry["subl"] = subl
-                    entry["result"] = out
-                    results["actions"].append(entry)
-                    exec_log.append(entry)
-                    continue
-
-                entry["error"] = f"Unknown action type: {atype}"
-                results["actions"].append(entry)
-                exec_log.append(entry)
-                raise PlanExecutionError(entry["error"])
-
-            finally:
-                if self.trace is not None:
-                    self.trace.write("cyc_action_end", i=idx, type=atype, entry=entry)
-
-        return results
-
-    def _extract_answer_signal(self, plan: Dict[str, Any], cyc_results: Dict[str, Any]) -> Optional[AnswerSignal]:
-        actions = plan.get("actions", []) or []
-        if not actions:
-            return None
-        final_idx = len(actions) - 1
-        final = actions[-1]
-        ftype = (final.get("type") or "").strip()
-        if ftype not in ("ask_var", "ask_true"):
-            return None
-
-        res_actions = cyc_results.get("actions", []) or []
-        res_entry: Optional[Dict[str, Any]] = None
-        for e in res_actions:
-            if e.get("i") == final_idx and (e.get("type") or "").strip() == ftype:
-                res_entry = e
-                break
-        if res_entry is None:
-            return None
-
-        if ftype == "ask_true":
-            if "answer" not in res_entry:
-                return None
-            ans = bool(res_entry.get("answer"))
-            return AnswerSignal(
-                action_index=final_idx,
-                action_type=ftype,
-                answer_text="true" if ans else "false",
-                raw_value=ans,
-                query=str(res_entry.get("query") or ""),
-            )
-
-        bindings = res_entry.get("bindings", [])
-        if not isinstance(bindings, list) or not bindings:
-            return None
-        answer_text = "\n".join(str(x) for x in bindings if x is not None and str(x).strip() != "")
-        if not answer_text.strip():
-            return None
-        return AnswerSignal(
-            action_index=final_idx,
-            action_type=ftype,
-            answer_text=answer_text,
-            raw_value=bindings,
-            query=str(res_entry.get("query") or ""),
-        )
-
-    # -----------------------------
-    # Answer generation
-    # -----------------------------
-
-    def _generate_answer(
+    def _format_result(
         self,
-        user_prompt: str,
-        cyc_results: Dict[str, Any],
-        exec_log: List[Dict[str, Any]],
-        answer_signal: AnswerSignal,
-    ) -> Dict[str, Any]:
-        authoritative_answer = answer_signal.answer_text
+        *,
+        query_type: str,
+        query: str,
+        var: str,
+        raw_value: Any,
+    ) -> Tuple[str, List[str], List[str]]:
+        evidence: List[str] = []
+        limitations: List[str] = []
 
-        payload = {
-            "cyc_results": cyc_results,
-            "execution_log": exec_log,
-            "final_action": {
-                "action_index": answer_signal.action_index,
-                "action_type": answer_signal.action_type,
-                "query": answer_signal.query,
-                "raw_value": answer_signal.raw_value,
-            },
-        }
+        evidence.append(f"{query_type}: {query}")
 
-        messages = build_answer_messages(
-            user_prompt=user_prompt,
-            cyc_results=payload,
-            authoritative_answer=authoritative_answer,
-            conversation=self.conversation,
-        )
+        if query_type == "ask_true":
+            ans = bool(raw_value)
+            return ("true" if ans else "false"), evidence, limitations
 
-        ans = self._llm_chat_json(kind="answerer", messages=messages, schema=answer_json_schema())
+        # ask_var
+        bindings = raw_value if isinstance(raw_value, list) else []
+        if not bindings:
+            limitations.append("OpenCyc returned no bindings for the translated query.")
+            return "(no bindings)", evidence, limitations
 
-        if not isinstance(ans, dict) or "answer" not in ans:
-            raise OllamaError(f"Answerer returned invalid JSON: {ans}")
+        rendered: List[str] = []
+        for b in bindings:
+            rendered.append(self._term_to_english(str(b)))
 
-        # Enforce list types
-        ans["cyc_evidence"] = list(ans.get("cyc_evidence", []))
-        ans["limitations"] = list(ans.get("limitations", []))
+        # If the NL rendering differs from raw, we can optionally show both in debug mode.
+        if self.debug:
+            evidence.append(f"var={var}  count={len(bindings)}")
 
-        # Hard guard: never allow the answerer to substitute a different answer.
-        if str(ans.get("answer", "")).strip() != authoritative_answer.strip():
-            ans["limitations"].append(
-                "Answer text was corrected to match the authoritative OpenCyc-derived value."
-            )
-            ans["answer"] = authoritative_answer
-
-        return ans
-
-
-def _slim_error_context(error_context: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    if not error_context:
-        return None
-    slim = {
-        "attempt": error_context.get("attempt"),
-        "error_type": error_context.get("error_type"),
-        "error": error_context.get("error"),
-    }
-    # Add last action if present
-    exec_log = error_context.get("execution_log") or []
-    if exec_log:
-        slim["last_action"] = exec_log[-1]
-    # Add final query result if present
-    cyc_results = error_context.get("cyc_results") or {}
-    if isinstance(cyc_results, dict) and cyc_results.get("actions"):
-        slim["last_cyc_action"] = cyc_results.get("actions")[-1]
-    return slim
-
-
-def _augment_prompt_with_error(user_prompt: str, error_context: Dict[str, Any]) -> str:
-    # Keep error payload compact; planner only needs the gist.
-    slim = _slim_error_context(error_context) or {}
-    return f"""{user_prompt}
-
-PREVIOUS PLAN FAILED.
-Error context (JSON):
-{json.dumps(slim, indent=2)}
-
-Please produce a corrected plan that:
-- Uses fully parenthesized CycL in assert/query.
-- Avoids creating placeholder constants (no ensure_* names).
-- Ends with an ask_var/ask_true whose result directly contains the answer.
-- If OpenCyc returned no bindings previously, assert the *minimal* missing facts in the session MT and re-query."""
+        return "\n".join(rendered), evidence, limitations

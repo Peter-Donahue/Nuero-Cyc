@@ -11,13 +11,12 @@ from .config import Settings
 from .orchestrator import Orchestrator, RunResult
 
 
-HELP_TEXT = """Commands:
-  /help                 Show this help
-  /debug on|off         Toggle debug output
-  /trace on|off [path]  Enable/disable LLM call tracing (writes JSONL to a file)
-  /session              Show current session microtheory
-  /health               Check Cyc bridge health
-  /exit                 Quit
+_HELP_TEXT = """Commands:
+  /help          Show this help
+  /debug on|off  Toggle debug output
+  /session       Show current session microtheory
+  /health        Check Cyc bridge health
+  /exit          Quit
 """
 
 
@@ -25,27 +24,19 @@ def run_cli(
     *,
     settings: Settings,
     debug: bool,
-    allow_converse: bool,
     once: Optional[str],
-    llm_trace: Optional[str] = None,
     show_progress: bool = True,
 ) -> int:
     console = Console()
 
     orch = Orchestrator(settings)
     orch.set_debug(debug)
-    orch.allow_converse = allow_converse
 
     # Progress messages
     if show_progress and settings.show_progress:
         orch.set_progress_callback(lambda m: console.print(f"[dim]{m}[/dim]"))
     else:
         orch.set_progress_callback(None)
-
-    # Optional LLM trace
-    trace_path: Optional[str] = None
-    if llm_trace:
-        trace_path = orch.enable_trace(llm_trace)
 
     # Health check
     try:
@@ -56,10 +47,20 @@ def run_cli(
             f"cyc_connected: {health.get('cyc_connected')}",
             f"cyc_host: {health.get('cyc_host')}  cyc_port: {health.get('cyc_port')}",
             f"session_mt: {orch.session_info.session_mt}",
-            f"ollama: {settings.ollama_base_url}  model: {settings.ollama_model}",
+            "",
+            "[bold]CoreNLP[/bold]",
+            f"base_url: {settings.corenlp_base_url}",
+            "",
+            "[bold]Lexicon/Scoring[/bold]",
+            f"use_cyc_lexicon: {settings.use_cyc_lexicon}",
+            f"use_cyc_scorer:  {settings.use_cyc_scorer}",
+            f"cyc_lexicon_mt:  {settings.cyc_lexicon_mt}",
+            f"cyc_query_mt:    {settings.cyc_query_mt}",
+            f"cyc_lex_limit:   {settings.cyc_lex_limit}",
+            "",
+            "[bold]Output[/bold]",
+            f"use_cyc_nl:      {settings.use_cyc_nl}",
         ]
-        if trace_path:
-            status_lines.append(f"llm_trace: {trace_path}")
         console.print(Panel.fit("\n".join(status_lines), title="Status"))
     except Exception as e:
         console.print(Panel.fit(f"[bold red]Startup error[/bold red]\n{e}", title="Error"))
@@ -72,12 +73,12 @@ def run_cli(
         finally:
             orch.close()
 
-    console.print(Panel.fit(HELP_TEXT.strip(), title="Help"))
+    console.print(Panel.fit(_HELP_TEXT.strip(), title="Help"))
 
     try:
         while True:
             try:
-                line = Prompt.ask("cyc-llm").strip()
+                line = Prompt.ask("cyc").strip()
             except (EOFError, KeyboardInterrupt):
                 console.print()
                 break
@@ -96,7 +97,7 @@ def run_cli(
                 console.print(Panel.fit(f"[bold red]Error[/bold red]\n{e}", title="Run failed"))
                 continue
 
-            _render_result(console, res, debug=orch.ctx.debug)
+            _render_result(console, res, debug=orch.debug)
 
         return 0
     finally:
@@ -109,7 +110,7 @@ def _run_once(console: Console, orch: Orchestrator, prompt: str) -> int:
     except Exception as e:
         console.print(Panel.fit(f"[bold red]Error[/bold red]\n{e}", title="Run failed"))
         return 2
-    _render_result(console, res, debug=orch.ctx.debug)
+    _render_result(console, res, debug=orch.debug)
     return 0
 
 
@@ -121,49 +122,27 @@ def _handle_command(console: Console, orch: Orchestrator, line: str) -> bool:
         return True
 
     if cmd == "/help":
-        console.print(Panel.fit(HELP_TEXT.strip(), title="Help"))
+        console.print(Panel.fit(_HELP_TEXT.strip(), title="Help"))
         return False
 
     if cmd == "/debug":
         if len(parts) < 2:
-            console.print(f"debug is {'on' if orch.ctx.debug else 'off'}")
+            console.print(f"debug is {'on' if orch.debug else 'off'}")
             return False
         v = parts[1].lower()
         orch.set_debug(v in ("1", "true", "on", "yes"))
-        console.print(f"debug set to {'on' if orch.ctx.debug else 'off'}")
-        return False
-
-    if cmd == "/trace":
-        if len(parts) < 2:
-            if orch.trace_path:
-                console.print(f"llm trace is on: {orch.trace_path}")
-            else:
-                console.print("llm trace is off")
-            return False
-
-        arg = parts[1]
-        arg_l = arg.lower()
-        if arg_l in ("1", "true", "on", "yes"):
-            path = orch.enable_trace("auto")
-            console.print(f"llm trace enabled: {path}")
-            return False
-        if arg_l in ("0", "false", "off", "no"):
-            orch.disable_trace()
-            console.print("llm trace disabled")
-            return False
-
-        # treat as path
-        path = orch.enable_trace(arg)
-        console.print(f"llm trace enabled: {path}")
+        console.print(f"debug set to {'on' if orch.debug else 'off'}")
         return False
 
     if cmd == "/session":
-        console.print(Panel.fit(
-            f"session_id: {orch.session_info.session_id}\n"
-            f"session_mt: {orch.session_info.session_mt}\n"
-            f"genl_mt: {orch.session_info.genl_mt}\n",
-            title="Session"
-        ))
+        console.print(
+            Panel.fit(
+                f"session_id: {orch.session_info.session_id}\n"
+                f"session_mt: {orch.session_info.session_mt}\n"
+                f"genl_mt: {orch.session_info.genl_mt}\n",
+                title="Session",
+            )
+        )
         return False
 
     if cmd == "/health":
