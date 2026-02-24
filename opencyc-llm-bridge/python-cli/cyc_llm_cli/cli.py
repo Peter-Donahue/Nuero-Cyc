@@ -41,6 +41,15 @@ def run_cli(
     # Health check
     try:
         health = orch.cyc.health()
+
+        # Determine LLM augmentation status.
+        if not settings.use_llm_kb_augmentation:
+            llm_status = "disabled (--llm-aug to enable)"
+        elif orch._ollama is None:
+            llm_status = f"[bold yellow]unavailable[/bold yellow] (cannot reach {settings.ollama_base_url})"
+        else:
+            llm_status = f"[bold green]active[/bold green] ({settings.ollama_model} @ {settings.ollama_base_url})"
+
         status_lines = [
             "[bold]Cyc Bridge[/bold]",
             f"base_url: {settings.cyc_bridge_base_url}",
@@ -57,6 +66,9 @@ def run_cli(
             f"cyc_lexicon_mt:  {settings.cyc_lexicon_mt}",
             f"cyc_query_mt:    {settings.cyc_query_mt}",
             f"cyc_lex_limit:   {settings.cyc_lex_limit}",
+            "",
+            "[bold]LLM KB Augmentation[/bold]",
+            f"status: {llm_status}",
             "",
             "[bold]Output[/bold]",
             f"use_cyc_nl:      {settings.use_cyc_nl}",

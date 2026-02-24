@@ -68,5 +68,13 @@ class Settings:
     use_cyc_nl: bool = _getenv_bool("USE_CYC_NL", True)
     cyc_nl_mt: str = _getenv("CYC_NL_MT", "")  # if empty, defaults to cyc_lexicon_mt
 
+    # LLM-based KB augmentation via Ollama.
+    # When a query returns no results, ask an LLM for factual assertions,
+    # assert them into the session MT, then re-run the query.
+    use_llm_kb_augmentation: bool = _getenv_bool("USE_LLM_KB_AUGMENTATION", True)
+    ollama_base_url: str = _getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+    ollama_model: str = _getenv("OLLAMA_MODEL", "llama3")
+    ollama_timeout_sec: int = _getenv_int("OLLAMA_TIMEOUT_SEC", 120)
+
     # UI behavior.
     show_progress: bool = _getenv_bool("CYC_LLM_PROGRESS", True)

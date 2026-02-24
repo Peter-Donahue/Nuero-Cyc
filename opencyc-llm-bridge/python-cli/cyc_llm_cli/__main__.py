@@ -48,6 +48,28 @@ def main(argv: list[str] | None = None) -> int:
         help="HTTP timeout seconds for CoreNLP + Cyc bridge (overrides HTTP_TIMEOUT_SEC env)",
     )
 
+    # LLM KB augmentation
+    parser.add_argument(
+        "--llm-aug",
+        action="store_true",
+        help="Enable LLM-based KB augmentation: when a query returns no results, "
+             "ask Ollama for facts, assert them, and re-query (overrides USE_LLM_KB_AUGMENTATION env)",
+    )
+    parser.add_argument("--no-llm-aug", action="store_true", help="Disable LLM KB augmentation")
+    parser.add_argument(
+        "--ollama",
+        help="Ollama base URL, e.g. http://localhost:11434 (overrides OLLAMA_BASE_URL env)",
+    )
+    parser.add_argument(
+        "--ollama-model",
+        help="Ollama model name, e.g. llama3 (overrides OLLAMA_MODEL env)",
+    )
+    parser.add_argument(
+        "--ollama-timeout",
+        type=int,
+        help="Ollama timeout seconds (overrides OLLAMA_TIMEOUT_SEC env)",
+    )
+
     args = parser.parse_args(argv)
 
     # Env overrides (simple)
@@ -70,6 +92,18 @@ def main(argv: list[str] | None = None) -> int:
         os.environ["USE_CYC_SCORER"] = "0"
     if args.no_cyc_nl:
         os.environ["USE_CYC_NL"] = "0"
+
+    # LLM augmentation overrides
+    if args.llm_aug:
+        os.environ["USE_LLM_KB_AUGMENTATION"] = "1"
+    if args.no_llm_aug:
+        os.environ["USE_LLM_KB_AUGMENTATION"] = "0"
+    if args.ollama:
+        os.environ["OLLAMA_BASE_URL"] = args.ollama
+    if args.ollama_model:
+        os.environ["OLLAMA_MODEL"] = args.ollama_model
+    if args.ollama_timeout is not None:
+        os.environ["OLLAMA_TIMEOUT_SEC"] = str(int(args.ollama_timeout))
 
     settings = Settings()
     return run_cli(

@@ -1169,6 +1169,35 @@ def _contains_unresolved_placeholder(term: CycLTerm) -> bool:
     return any(_contains_unresolved_placeholder(t) for t in term)
 
 
+def _subst_vars(term: CycLTerm, mapping: Dict[str, str]) -> CycLTerm:
+    """Substitute ``?Var`` variables in *term* according to *mapping*."""
+    if isinstance(term, str):
+        return mapping.get(term, term)
+    return [_subst_vars(sub, mapping) for sub in term]
+
+
+def _extract_isa_collections_rec(term: CycLTerm, var: str, out: List[str]) -> None:
+    """Recursively find ``(#$isa <var> <Collection>)`` in *term* and collect the collection constants."""
+    if isinstance(term, str):
+        return
+    if not term:
+        return
+    # Direct match: (#$isa ?X #$SomeCollection)
+    if (
+        len(term) == 3
+        and term[0] == "#$isa"
+        and term[1] == var
+        and isinstance(term[2], str)
+        and term[2].startswith("#$")
+    ):
+        out.append(term[2])
+        return
+    # Recurse into conjunctions and nested formulas.
+    for sub in term:
+        if isinstance(sub, list):
+            _extract_isa_collections_rec(sub, var, out)
+
+
 # ----------------------------
 # Dependency graph utilities
 # ----------------------------
@@ -1489,6 +1518,120 @@ class CycLTranslator:
                 formula = _there_exists(b.var, _and(b.restrictor, formula))
 
         return formula
+
+    # -----------------------------------------------------------------
+    # Assertion-mode translation (for KB augmentation)
+    # -----------------------------------------------------------------
+
+    def translate_to_assertions(
+        self,
+        ann: Dict[str, Any],
+        *,
+        entity_hint: Optional[str] = None,
+    ) -> List[str]:
+        """Translate a declarative CoreNLP annotation into ground CycL assertions.
+
+        Unlike ``translate_annotation_term`` (which wraps variables in quantifiers
+        to form a query), this method strips quantifiers and substitutes the known
+        *entity_hint* constant for any unresolved subject variable, producing flat
+        CycL sentences suitable for ``assert``.
+
+        Parameters
+        ----------
+        ann : dict
+            CoreNLP annotation JSON (must contain ``"sentences"``).
+        entity_hint : str or None
+            A ``#$``-prefixed Cyc constant representing the subject entity.
+            When provided, any variable that occupies the *subject position* and
+            that is not already a ground constant will be replaced with this value.
+
+        Returns
+        -------
+        list[str]
+            Zero or more fully-parenthesized CycL assertion strings with no free
+            variables.  Each string can be passed directly to
+            ``CycBridgeClient.assert_sentence``.
+        """
+        sents = ann.get("sentences") or []
+        if not sents:
+            return []
+
+        all_assertions: List[str] = []
+        for sent_data in sents:
+            try:
+                g = _DepGraph.from_corenlp_sentence(sent_data)
+                alloc = _VarAllocator()
+                body, bindings, var_types = self._translate_sentence(g, alloc)
+            except Exception:
+                continue
+
+            grounded = self._ground_assertion(body, bindings, entity_hint=entity_hint)
+            for term in grounded:
+                s = cycl_to_string(term)
+                # Skip trivial / tautological results.
+                if s in ("#$True", "#$False"):
+                    continue
+                # Skip if any unresolved variables remain.
+                if "?" in s:
+                    continue
+                all_assertions.append(s)
+
+        return all_assertions
+
+    def _ground_assertion(
+        self,
+        body: CycLTerm,
+        bindings: List[_Binding],
+        *,
+        entity_hint: Optional[str] = None,
+    ) -> List[CycLTerm]:
+        """Convert (body, bindings) into a list of ground CycL terms.
+
+        Strategy
+        --------
+        1. Build a substitution map  ``{var -> constant}``.
+           * The first existentially-bound variable is assumed to be the subject;
+             if *entity_hint* is supplied it replaces that variable.
+        2. Apply the substitution to *body*.
+        3. Extract additional ``(#$isa entity collection)`` assertions from any
+           binding restrictor that mentions a meaningful collection type.
+        """
+        subst: Dict[str, str] = {}
+        extra: List[CycLTerm] = []
+
+        hint_used = False
+        for b in bindings:
+            var = b.var
+            if entity_hint and not hint_used and b.quant == "exists":
+                subst[var] = entity_hint
+                hint_used = True
+                # Pull isa-type facts out of the restrictor (e.g., (isa ?X Person))
+                # and turn them into standalone assertions.
+                for coll in self._extract_isa_collections(b.restrictor, var):
+                    if coll not in ("#$True", "#$Thing", "#$Individual",
+                                    "#$TemporalThing", "#$SomethingExisting"):
+                        extra.append(["#$isa", entity_hint, coll])
+
+        grounded_body = _subst_vars(body, subst)
+        results: List[CycLTerm] = []
+
+        body_s = cycl_to_string(grounded_body)
+        if "?" not in body_s:
+            results.append(grounded_body)
+
+        for ea in extra:
+            ea_s = cycl_to_string(ea)
+            if "?" not in ea_s and ea_s != body_s:
+                results.append(ea)
+
+        return results
+
+    @staticmethod
+    def _extract_isa_collections(restrictor: CycLTerm, var: str) -> List[str]:
+        """Pull collection constants from ``(#$isa var Collection)`` clauses inside a restrictor."""
+        colls: List[str] = []
+        _extract_isa_collections_rec(restrictor, var, colls)
+        return colls
 
     def _maybe_translate_wh_is_proper_name(
         self, g: _DepGraph, alloc: _VarAllocator
